@@ -28,7 +28,7 @@ interface Props {
 export function ProxyCaptureDialog({ open, onOpenChange, apiKeys, isEn }: Props) {
   const [keyId, setKeyId] = useState('')
   const [minutes, setMinutes] = useState(15)
-  const [status, setStatus] = useState<{ active: boolean; captureId: string; count: number; expiresAt: number } | null>(null)
+  const [status, setStatus] = useState<{ active: boolean; captureId: string; count: number; bytes: number; expiresAt: number } | null>(null)
   const [report, setReport] = useState<CaptureReport | null>(null)
   const [busy, setBusy] = useState(false)
   const poll = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -104,7 +104,7 @@ export function ProxyCaptureDialog({ open, onOpenChange, apiKeys, isEn }: Props)
             <div className="flex items-center justify-between rounded border p-3">
               <div className="text-sm">
                 <div>{isEn ? 'Capturing' : '抓包中'}: <Badge variant="secondary">{status.captureId}</Badge></div>
-                <div className="text-muted-foreground mt-1">{isEn ? 'Captured' : '已抓'}: {status.count} · {isEn ? 'ends in' : '剩余'} {Math.max(0, Math.round((status.expiresAt - Date.now()) / 1000))}s</div>
+                <div className="text-muted-foreground mt-1">{isEn ? 'Captured' : '已抓'}: {status.count} · {((status.bytes || 0) / 1024 / 1024).toFixed(1)}MB · {isEn ? 'ends in' : '剩余'} {Math.max(0, Math.round((status.expiresAt - Date.now()) / 1000))}s</div>
               </div>
               <Button variant="outline" onClick={stop}>{isEn ? 'Stop' : '停止'}</Button>
             </div>
