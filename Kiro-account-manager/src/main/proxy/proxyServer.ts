@@ -283,7 +283,7 @@ export class ProxyServer {
   /** P1-8 会话粘性：session hint → accountId 的映射（10 分钟 TTL） */
   private sessionAffinity: Map<string, { accountId: string; lastAt: number }> = new Map()
   /** 每请求上下文：把来源 IP 透传到 recordRequest（避免逐个 handler 穿参，且并发安全） */
-  private requestContext: AsyncLocalStorage<{ clientIP: string; apiKeyId?: string; rawBody?: string }> = new AsyncLocalStorage()
+  private requestContext: AsyncLocalStorage<{ clientIP: string; apiKeyId?: string; rawBody?: string; sessionKey?: string }> = new AsyncLocalStorage()
   /** 抓包会话状态（进程内单例；不持久化，重启失效） */
   private capture: {
     active: boolean
@@ -1889,7 +1889,9 @@ export class ProxyServer {
       // clientIP 规范化：去掉 IPv4-mapped IPv6 前缀 ::ffff:
       const normalizedClientIP = clientIP.startsWith('::ffff:') ? clientIP.slice(7) : clientIP
       const ctxApiKeyId = (req as unknown as { captureKeyId?: string }).captureKeyId
-      await this.requestContext.run({ clientIP: normalizedClientIP, apiKeyId: ctxApiKeyId }, async () => {
+      // 会话 key 在此刻（有真实请求头，如 x-claude-code-session-id）解析；响应阶段头已不可回取
+      const ctxSessionKey = ProxyServer.extractSessionHint(req, {})
+      await this.requestContext.run({ clientIP: normalizedClientIP, apiKeyId: ctxApiKeyId, sessionKey: ctxSessionKey }, async () => {
       if (pathWithoutQuery === '/v1/models' || pathWithoutQuery === '/models') {
         await this.handleModels(res, controller.signal)
       } else if (pathWithoutQuery === '/v1/chat/completions' || pathWithoutQuery === '/chat/completions') {
@@ -3408,6 +3410,10 @@ export class ProxyServer {
       return Promise.reject(new BodyTooLargeError(declaredLen, maxBytes))
     }
 
+    // 在同步入口（仍处于 run() 的 ALS 上下文内）抓住 store 引用：
+    // socket 的 'end' 事件由连接层 I/O 触发，回调里 getStore() 已脱离上下文会返回 undefined，
+    // 故必须用闭包带住 store，否则抓包落盘的 body 永远为空。
+    const ctxStore = this.requestContext.getStore()
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = []
       let total = 0
@@ -3431,8 +3437,7 @@ export class ProxyServer {
       const onEnd = () => {
         cleanup()
         const bodyStr = Buffer.concat(chunks, total).toString('utf8')
-        const store = this.requestContext.getStore()
-        if (store) store.rawBody = bodyStr
+        if (ctxStore) ctxStore.rawBody = bodyStr
         resolve(bodyStr)
       }
       const onError = (error: Error) => {
@@ -3694,10 +3699,10 @@ export class ProxyServer {
       if (c.count >= c.maxCount || c.bytes >= c.maxBytes) { this.stopCapture('limit'); return }
       const body = store?.rawBody ?? ''
       const seq = c.count + 1
-      const sessionKey = ProxyServer.extractSessionHint(
-        { headers: {} } as unknown as http.IncomingMessage, // header 已无法回取，用 body 兜底
-        body ? safeJson(body) : {}
-      )
+      // 优先用 run() 时由真实请求头解析好的 sessionKey（含 x-claude-code-session-id）；
+      // 拿不到时用 body 字段兜底
+      const sessionKey = store?.sessionKey
+        || ProxyServer.extractSessionHint({ headers: {} } as unknown as http.IncomingMessage, body ? safeJson(body) : {})
       const meta = {
         seq, ts: Date.now(), path: info.path, model: info.model, clientIP: info.clientIP, status: info.status,
         sessionKey,
