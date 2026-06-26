@@ -6,6 +6,7 @@ interface LogEntry {
   time: string
   path: string
   model?: string
+  clientIP?: string
   status: number
   tokens?: number
   inputTokens?: number
@@ -45,8 +46,8 @@ export function ProxyLogsDialog({
   if (!open) return null
 
   const handleExport = () => {
-    const content = logs.map(log => 
-      `${log.time}\t${log.path}\t${log.status}${log.credits ? `\t${log.credits.toFixed(6)} credits` : ''}`
+    const content = logs.map(log =>
+      `${log.time}\t${log.clientIP || '-'}\t${log.path}\t${log.status}${log.credits ? `\t${log.credits.toFixed(6)} credits` : ''}`
     ).join('\n')
     const blob = new Blob([content], { type: 'text/plain' })
     const url = URL.createObjectURL(blob)
@@ -120,6 +121,7 @@ export function ProxyLogsDialog({
                 <thead className="bg-muted/50 sticky top-0">
                   <tr>
                     <th className="text-left p-2 font-medium">{isEn ? 'Time' : '时间'}</th>
+                    <th className="text-left p-2 font-medium">{isEn ? 'Source IP' : '来源IP'}</th>
                     <th className="text-left p-2 font-medium">{isEn ? 'Path' : '路径'}</th>
                     <th className="text-left p-2 font-medium">{isEn ? 'Model' : '模型'}</th>
                     <th className="text-center p-2 font-medium">{isEn ? 'Status' : '状态'}</th>
@@ -134,6 +136,7 @@ export function ProxyLogsDialog({
                   {logs.map((log, idx) => (
                     <tr key={idx} className="border-b border-muted/30 hover:bg-muted/30">
                       <td className="p-2 text-muted-foreground whitespace-nowrap">{log.time}</td>
+                      <td className="p-2 text-muted-foreground whitespace-nowrap" title={log.clientIP}>{log.clientIP || '-'}</td>
                       <td className="p-2 truncate max-w-[200px]" title={log.path}>{log.path}</td>
                       <td className="p-2 truncate max-w-[150px] text-muted-foreground" title={log.model}>{log.model ? log.model.replace('anthropic.', '').replace('-v1:0', '') : '-'}</td>
                       <td className="p-2 text-center relative">

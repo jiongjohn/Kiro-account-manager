@@ -640,6 +640,7 @@ export interface RequestLog {
   path: string
   model: string
   accountId: string
+  clientIP?: string // 来源 IP（socket 远端地址，已去 ::ffff: 前缀）
   inputTokens: number
   outputTokens: number
   cacheReadTokens?: number
