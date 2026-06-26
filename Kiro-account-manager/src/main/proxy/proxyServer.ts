@@ -274,7 +274,7 @@ export class ProxyServer {
   /** P1-8 会话粘性：session hint → accountId 的映射（10 分钟 TTL） */
   private sessionAffinity: Map<string, { accountId: string; lastAt: number }> = new Map()
   /** 每请求上下文：把来源 IP 透传到 recordRequest（避免逐个 handler 穿参，且并发安全） */
-  private requestContext: AsyncLocalStorage<{ clientIP: string }> = new AsyncLocalStorage()
+  private requestContext: AsyncLocalStorage<{ clientIP: string; apiKeyId?: string; rawBody?: string }> = new AsyncLocalStorage()
   /** P2-17 审计日志（最近 200 条） */
   private auditLog: Array<{ ts: number; type: string; data: Record<string, unknown> }> = []
   /** Webhook 触发回调（由外部注入，避免 main → renderer 循环依赖） */
@@ -1863,7 +1863,8 @@ export class ProxyServer {
       // 把来源 IP 注入 AsyncLocalStorage，供下游 recordRequest 记录（含流式回调、handleApiError 等无 req 处）
       // clientIP 规范化：去掉 IPv4-mapped IPv6 前缀 ::ffff:
       const normalizedClientIP = clientIP.startsWith('::ffff:') ? clientIP.slice(7) : clientIP
-      await this.requestContext.run({ clientIP: normalizedClientIP }, async () => {
+      const ctxApiKeyId = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey?.id
+      await this.requestContext.run({ clientIP: normalizedClientIP, apiKeyId: ctxApiKeyId }, async () => {
       if (pathWithoutQuery === '/v1/models' || pathWithoutQuery === '/models') {
         await this.handleModels(res, controller.signal)
       } else if (pathWithoutQuery === '/v1/chat/completions' || pathWithoutQuery === '/chat/completions') {
@@ -3404,7 +3405,10 @@ export class ProxyServer {
       }
       const onEnd = () => {
         cleanup()
-        resolve(Buffer.concat(chunks, total).toString('utf8'))
+        const bodyStr = Buffer.concat(chunks, total).toString('utf8')
+        const store = this.requestContext.getStore()
+        if (store) store.rawBody = bodyStr
+        resolve(bodyStr)
       }
       const onError = (error: Error) => {
         cleanup()
