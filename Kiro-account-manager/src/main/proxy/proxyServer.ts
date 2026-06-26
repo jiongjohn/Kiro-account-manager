@@ -41,7 +41,7 @@ import { loadSteeringDocuments, formatSteeringForPrompt, type SteeringDocument }
 
 export interface ProxyServerEvents {
   onRequest?: (info: { path: string; method: string; accountId?: string }) => void
-  onResponse?: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string; clientIP?: string }) => void
+  onResponse?: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string; clientIP?: string; accountId?: string }) => void
   onError?: (error: Error) => void
   onConfigChanged?: (config: ProxyConfig) => void  // API Key 用量更新时触发
   onStatusChange?: (running: boolean, port: number) => void
@@ -283,7 +283,7 @@ export class ProxyServer {
   /** P1-8 会话粘性：session hint → accountId 的映射（10 分钟 TTL） */
   private sessionAffinity: Map<string, { accountId: string; lastAt: number }> = new Map()
   /** 每请求上下文：把来源 IP 透传到 recordRequest（避免逐个 handler 穿参，且并发安全） */
-  private requestContext: AsyncLocalStorage<{ clientIP: string; apiKeyId?: string; rawBody?: string; sessionKey?: string }> = new AsyncLocalStorage()
+  private requestContext: AsyncLocalStorage<{ clientIP: string; apiKeyId?: string; rawBody?: string; sessionKey?: string; betaHeader?: string }> = new AsyncLocalStorage()
   /** 抓包会话状态（进程内单例；不持久化，重启失效） */
   private capture: {
     active: boolean
@@ -1891,7 +1891,8 @@ export class ProxyServer {
       const ctxApiKeyId = (req as unknown as { captureKeyId?: string }).captureKeyId
       // 会话 key 在此刻（有真实请求头，如 x-claude-code-session-id）解析；响应阶段头已不可回取
       const ctxSessionKey = ProxyServer.extractSessionHint(req, {})
-      await this.requestContext.run({ clientIP: normalizedClientIP, apiKeyId: ctxApiKeyId, sessionKey: ctxSessionKey }, async () => {
+      const ctxBetaHeader = (req.headers['anthropic-beta'] as string) || undefined
+      await this.requestContext.run({ clientIP: normalizedClientIP, apiKeyId: ctxApiKeyId, sessionKey: ctxSessionKey, betaHeader: ctxBetaHeader }, async () => {
       if (pathWithoutQuery === '/v1/models' || pathWithoutQuery === '/models') {
         await this.handleModels(res, controller.signal)
       } else if (pathWithoutQuery === '/v1/chat/completions' || pathWithoutQuery === '/chat/completions') {
@@ -2627,7 +2628,7 @@ export class ProxyServer {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(response))
         const respTime = Date.now() - startTime
-        this.emitResponse({ path: '/v1/chat/completions', model: request.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
+        this.emitResponse({ path: '/v1/chat/completions', model: request.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime, accountId: usedAccount.id })
         this.recordRequest({ path: '/v1/chat/completions', model: request.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
         // 记录 API Key 用量
         if (matchedApiKey) {
@@ -2744,7 +2745,7 @@ export class ProxyServer {
         this.stats.outputTokens += result.usage.outputTokens
         this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
         const respTime = Date.now() - startTime
-        this.emitResponse({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
+        this.emitResponse({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime, accountId: usedAccount.id })
         this.recordRequest({ path: '/v1/responses', model: chatRequest.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
         if (matchedApiKey) {
           this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses')
@@ -2774,7 +2775,7 @@ export class ProxyServer {
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(response))
       const respTime = Date.now() - startTime
-      this.emitResponse({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
+      this.emitResponse({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime, accountId: usedAccount.id })
       this.recordRequest({ path: '/v1/responses', model: chatRequest.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
       if (matchedApiKey) {
         this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses')
@@ -2875,7 +2876,7 @@ export class ProxyServer {
           this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
           this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
           const oaiRespTime = Date.now() - startTime
-          this.emitResponse({ path: '/v1/chat/completions', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: oaiRespTime })
+          this.emitResponse({ path: '/v1/chat/completions', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: oaiRespTime, accountId: account.id })
           this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: oaiRespTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
@@ -3073,7 +3074,7 @@ export class ProxyServer {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(response))
         const respTime = Date.now() - startTime
-        this.emitResponse({ path: '/v1/messages', model: request.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
+        this.emitResponse({ path: '/v1/messages', model: request.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime, accountId: usedAccount.id })
         this.recordRequest({ path: '/v1/messages', model: request.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
       }
     } catch (error) {
@@ -3303,7 +3304,7 @@ export class ProxyServer {
           this.stats.cacheWriteTokens += usage.cacheWriteTokens || simulatedCacheUsage?.cacheCreationInputTokens || 0
           this.stats.reasoningTokens += usage.reasoningTokens || 0
           const respTime = Date.now() - startTime
-          this.emitResponse({ path: '/v1/messages', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: respTime })
+          this.emitResponse({ path: '/v1/messages', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: respTime, accountId: account.id })
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: respTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
@@ -3706,6 +3707,8 @@ export class ProxyServer {
       const meta = {
         seq, ts: Date.now(), path: info.path, model: info.model, clientIP: info.clientIP, status: info.status,
         sessionKey,
+        accountId: info.accountId,
+        betaHeader: store?.betaHeader,
         usage: {
           inputTokens: info.inputTokens || 0,
           outputTokens: info.outputTokens || 0,

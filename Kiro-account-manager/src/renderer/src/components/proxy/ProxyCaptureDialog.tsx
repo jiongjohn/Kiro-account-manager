@@ -14,7 +14,7 @@ interface CaptureReport {
     byModel: Record<string, { requests: number; cacheReadTokens: number; cacheCreateTokens: number }>
   }
   sessions: { sessionKey: string; requests: number; hits: number; hitRate: number; requestSeqs: number[] }[]
-  breakers: { sessionKey: string; prevSeq: number; curSeq: number; reason: string; detail: { changedBlockIndex?: number; prevSha?: string; curSha?: string; snippet?: string } }[]
+  breakers: { sessionKey: string; prevSeq: number; curSeq: number; reason: string; detail: { changedBlockIndex?: number; prevSha?: string; curSha?: string; snippet?: string; prevAccountId?: string; curAccountId?: string } }[]
   configWarnings: string[]
 }
 
@@ -125,7 +125,7 @@ export function ProxyCaptureDialog({ open, onOpenChange, apiKeys, isEn }: Props)
                   <div className="space-y-1 text-sm font-mono">
                     {report.breakers.map((b, i) => (
                       <div key={i} className="rounded border border-destructive/30 p-2">
-                        <div>{isEn ? 'session' : '会话'} {b.sessionKey.slice(0, 24)} · req#{b.prevSeq}→#{b.curSeq} · <span className="text-destructive">{b.reason}</span>{b.detail.changedBlockIndex !== undefined ? ` system[${b.detail.changedBlockIndex}]` : ''}</div>
+                        <div>{isEn ? 'session' : '会话'} {b.sessionKey.slice(0, 24)} · req#{b.prevSeq}→#{b.curSeq} · <span className="text-destructive">{b.reason}</span>{b.detail.changedBlockIndex !== undefined ? ` system[${b.detail.changedBlockIndex}]` : ''}{b.reason === 'account_switched' ? ` ${b.detail.prevAccountId?.slice(0, 8)}→${b.detail.curAccountId?.slice(0, 8)}` : ''}</div>
                         {b.detail.snippet && <pre className="whitespace-pre-wrap break-all bg-muted/40 p-1 mt-1 text-xs max-h-24 overflow-y-auto">{b.detail.snippet}</pre>}
                       </div>
                     ))}

@@ -102,3 +102,14 @@ test('configWarnings: large system without cache_control', () => {
     { captureId: 'c1', apiKeyId: 'k1', startedAt: 0, endedAt: 100, stoppedReason: 'manual' })
   assert.ok(r.configWarnings.some(w => w.includes('未启用') || w.includes('cache_control')))
 })
+
+test('breaker: account_switched when content identical but upstream account differs', () => {
+  const same = sysBody(['AAA', 'BBB'])
+  const prev: CaptureEntry = { meta: { seq: 1, ts: 1001, path: '/v1/messages', model: 'm', status: 200, sessionKey: 'S1', accountId: 'acc-A', usage: { inputTokens: 100, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 80, credits: 0 } }, body: same }
+  const cur: CaptureEntry = { meta: { seq: 2, ts: 1002, path: '/v1/messages', model: 'm', status: 200, sessionKey: 'S1', accountId: 'acc-B', usage: { inputTokens: 100, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 80, credits: 0 } }, body: same }
+  const r = analyzeCaptures([prev, cur], { captureId: 'c1', apiKeyId: 'k1', startedAt: 0, endedAt: 100, stoppedReason: 'manual' })
+  assert.equal(r.breakers.length, 1)
+  assert.equal(r.breakers[0].reason, 'account_switched')
+  assert.equal(r.breakers[0].detail.prevAccountId, 'acc-A')
+  assert.equal(r.breakers[0].detail.curAccountId, 'acc-B')
+})

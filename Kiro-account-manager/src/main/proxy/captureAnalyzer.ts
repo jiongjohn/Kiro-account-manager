@@ -18,6 +18,8 @@ export interface CaptureMeta {
   clientIP?: string
   status: number
   sessionKey?: string
+  accountId?: string   // 服务该请求的上游账号；Bedrock 缓存按账号隔离，换账号必 miss
+  betaHeader?: string  // anthropic-beta 请求头（如 prompt-caching-*）
   usage: CaptureUsage
 }
 
@@ -38,8 +40,8 @@ export interface CacheBreaker {
   sessionKey: string
   prevSeq: number
   curSeq: number
-  reason: 'system_block_changed' | 'system_blocks_count_changed' | 'tools_changed' | 'cache_control_moved' | 'unknown'
-  detail: { changedBlockIndex?: number; prevSha?: string; curSha?: string; prevBlockCount?: number; curBlockCount?: number; snippet?: string }
+  reason: 'system_block_changed' | 'system_blocks_count_changed' | 'tools_changed' | 'cache_control_moved' | 'account_switched' | 'unknown'
+  detail: { changedBlockIndex?: number; prevSha?: string; curSha?: string; prevBlockCount?: number; curBlockCount?: number; snippet?: string; prevAccountId?: string; curAccountId?: string }
 }
 
 export interface CaptureReport {
@@ -128,6 +130,12 @@ function detectBreaker(sessionKey: string, prev: CaptureEntry, cur: CaptureEntry
   if (ccPositions(pb) !== ccPositions(cb)) {
     return { ...base, reason: 'cache_control_moved', detail: {} }
   }
+  // 内容前缀完全一致却未命中：先看是否换了上游账号（Bedrock 缓存按账号隔离，换账号必 miss）
+  const pa = prev.meta.accountId, ca = cur.meta.accountId
+  if (pa && ca && pa !== ca) {
+    return { ...base, reason: 'account_switched', detail: { prevAccountId: pa, curAccountId: ca } }
+  }
+  // 内容同、账号同仍 miss → 多半是缓存 TTL 过期（>5min）或其它
   return { ...base, reason: 'unknown', detail: {} }
 }
 
