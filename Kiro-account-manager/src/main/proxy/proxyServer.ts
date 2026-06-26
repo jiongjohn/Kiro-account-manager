@@ -2,6 +2,7 @@
 import http from 'http'
 import https from 'https'
 import fs from 'fs'
+import path from 'path'
 import crypto from 'crypto'
 import { AsyncLocalStorage } from 'async_hooks'
 import { v4 as uuidv4 } from 'uuid'
@@ -256,6 +257,10 @@ class BodyTooLargeError extends Error {
   }
 }
 
+function safeJson(s: string): unknown {
+  try { return JSON.parse(s) } catch { return {} }
+}
+
 export class ProxyServer {
   private server: http.Server | https.Server | null = null
   private fallbackServer: http.Server | null = null  // HTTPS 启用时同时监听 HTTP（可选）
@@ -275,6 +280,20 @@ export class ProxyServer {
   private sessionAffinity: Map<string, { accountId: string; lastAt: number }> = new Map()
   /** 每请求上下文：把来源 IP 透传到 recordRequest（避免逐个 handler 穿参，且并发安全） */
   private requestContext: AsyncLocalStorage<{ clientIP: string; apiKeyId?: string; rawBody?: string }> = new AsyncLocalStorage()
+  /** 抓包会话状态（进程内单例；不持久化，重启失效） */
+  private capture: {
+    active: boolean
+    captureId: string
+    apiKeyId: string
+    dir: string
+    startedAt: number
+    expiresAt: number
+    count: number
+    bytes: number
+    maxCount: number
+    maxBytes: number
+    stoppedReason?: 'manual' | 'timeout' | 'limit'
+  } | null = null
   /** P2-17 审计日志（最近 200 条） */
   private auditLog: Array<{ ts: number; type: string; data: Record<string, unknown> }> = []
   /** Webhook 触发回调（由外部注入，避免 main → renderer 循环依赖） */
@@ -3629,9 +3648,74 @@ export class ProxyServer {
     return lines.join('\n') + '\n'
   }
 
+  /** 开始抓包：针对单个 apiKeyId，落盘到 dir。返回 captureId。 */
+  startCapture(opts: { apiKeyId: string; durationMs: number; dir: string; maxCount?: number; maxBytes?: number }): { captureId: string } {
+    if (this.capture?.active) throw new Error('已有抓包进行中')
+    const captureId = `cap-${opts.dir.split(/[\\/]/).pop()}`
+    const now = Date.now()
+    this.capture = {
+      active: true, captureId, apiKeyId: opts.apiKeyId, dir: opts.dir,
+      startedAt: now, expiresAt: now + opts.durationMs, count: 0, bytes: 0,
+      maxCount: opts.maxCount ?? 2000, maxBytes: opts.maxBytes ?? 500 * 1024 * 1024
+    }
+    try { fs.mkdirSync(opts.dir, { recursive: true }) } catch { /* ignore */ }
+    return { captureId }
+  }
+
+  stopCapture(reason: 'manual' | 'timeout' | 'limit'): { captureId: string; count: number } | null {
+    if (!this.capture) return null
+    this.capture.active = false
+    this.capture.stoppedReason = reason
+    const out = { captureId: this.capture.captureId, count: this.capture.count }
+    return out
+  }
+
+  getCaptureStatus(): typeof this.capture {
+    return this.capture
+  }
+
+  /** 在 emitResponse 内调用：命中目标 key 则落盘 body + meta。绝不抛错。 */
+  private captureIfActive(info: Parameters<NonNullable<ProxyServerEvents['onResponse']>>[0]): void {
+    const c = this.capture
+    if (!c || !c.active) return
+    try {
+      const store = this.requestContext.getStore()
+      const apiKeyId = store?.apiKeyId
+      if (apiKeyId !== c.apiKeyId) return
+      if (Date.now() > c.expiresAt) return // 到点未停时兜底跳过；实际停由 index.ts timer
+      if (c.count >= c.maxCount || c.bytes >= c.maxBytes) { this.stopCapture('limit'); return }
+      const body = store?.rawBody ?? ''
+      const seq = c.count + 1
+      const sessionKey = ProxyServer.extractSessionHint(
+        { headers: {} } as unknown as http.IncomingMessage, // header 已无法回取，用 body 兜底
+        body ? safeJson(body) : {}
+      )
+      const meta = {
+        seq, ts: Date.now(), path: info.path, model: info.model, clientIP: info.clientIP, status: info.status,
+        sessionKey,
+        usage: {
+          inputTokens: info.inputTokens || 0,
+          outputTokens: info.outputTokens || 0,
+          cacheReadTokens: info.cacheReadTokens || 0,
+          cacheWriteTokens: info.cacheWriteTokens || 0,
+          credits: info.credits || 0
+        }
+      }
+      const base = path.join(c.dir, `req-${String(seq).padStart(4, '0')}`)
+      fs.writeFileSync(`${base}.json`, body)
+      fs.writeFileSync(`${base}.meta.json`, JSON.stringify(meta))
+      c.count = seq
+      c.bytes += Buffer.byteLength(body)
+    } catch (e) {
+      proxyLogger.warn('ProxyServer', `capture write failed: ${(e as Error).message}`)
+    }
+  }
+
   // onResponse 统一出口：自动注入当前请求的来源 IP（来自 AsyncLocalStorage），供 UI 实时日志展示
   private emitResponse(info: Parameters<NonNullable<ProxyServerEvents['onResponse']>>[0]): void {
-    this.events.onResponse?.({ ...info, clientIP: info.clientIP ?? this.requestContext.getStore()?.clientIP })
+    const withIp = { ...info, clientIP: info.clientIP ?? this.requestContext.getStore()?.clientIP }
+    this.events.onResponse?.(withIp)
+    this.captureIfActive(withIp)
   }
 
   // 记录请求到 recentRequests
