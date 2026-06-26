@@ -38,3 +38,33 @@ test('totals: cache hit rate and byModel', () => {
   assert.equal(r.totals.byModel['claude-sonnet-4-6'].requests, 2)
   assert.equal(r.totals.byModel['claude-sonnet-4-6'].cacheReadTokens, 4000)
 })
+
+function sysBody(blocks: string[], tools: unknown[] = []): unknown {
+  return { system: blocks.map(t => ({ type: 'text', text: t, cache_control: { type: 'ephemeral' } })), tools, messages: [{ role: 'user', content: 'hi' }] }
+}
+
+test('breaker: system block changed between consecutive misses', () => {
+  const prev = sysBody(['AAA', 'BBB', 'CCC'])
+  const cur = sysBody(['AAA', 'BBB', 'CCX']) // 第 3 块变了
+  const r = analyzeCaptures([
+    mk(1, 'S1', { cacheWriteTokens: 100 }, prev),
+    mk(2, 'S1', { cacheReadTokens: 0 }, cur),   // 未命中
+  ], { captureId: 'c1', apiKeyId: 'k1', startedAt: 0, endedAt: 100, stoppedReason: 'manual' })
+  assert.equal(r.breakers.length, 1)
+  const b = r.breakers[0]
+  assert.equal(b.reason, 'system_block_changed')
+  assert.equal(b.detail.changedBlockIndex, 2)
+  assert.equal(b.prevSeq, 1)
+  assert.equal(b.curSeq, 2)
+  assert.notEqual(b.detail.prevSha, b.detail.curSha)
+})
+
+test('breaker: tools changed', () => {
+  const prev = sysBody(['AAA'], [{ name: 't1' }])
+  const cur = sysBody(['AAA'], [{ name: 't2' }])
+  const r = analyzeCaptures([
+    mk(1, 'S1', { cacheWriteTokens: 100 }, prev),
+    mk(2, 'S1', { cacheReadTokens: 0 }, cur),
+  ], { captureId: 'c1', apiKeyId: 'k1', startedAt: 0, endedAt: 100, stoppedReason: 'manual' })
+  assert.equal(r.breakers[0].reason, 'tools_changed')
+})

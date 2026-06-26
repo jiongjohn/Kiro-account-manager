@@ -1,5 +1,7 @@
 // 代理抓包分析（纯函数，无副作用，可单测）
 
+import { createHash } from 'node:crypto'
+
 export interface CaptureUsage {
   inputTokens: number
   outputTokens: number
@@ -79,6 +81,56 @@ function keyOf(e: CaptureEntry): string {
   return e.meta.sessionKey || bodySessionKey(e.body)
 }
 
+function sha12(s: string): string {
+  return createHash('sha256').update(s).digest('hex').slice(0, 12)
+}
+
+interface SysBlock { text: string; hasCC: boolean }
+
+function systemBlocks(body: unknown): SysBlock[] {
+  const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>
+  const sys = b.system
+  if (typeof sys === 'string') return [{ text: sys, hasCC: false }]
+  if (Array.isArray(sys)) {
+    return sys.map(x => {
+      const o = (x && typeof x === 'object' ? x : {}) as Record<string, unknown>
+      return { text: typeof o.text === 'string' ? o.text : JSON.stringify(o), hasCC: !!o.cache_control }
+    })
+  }
+  return []
+}
+
+function toolsSig(body: unknown): string {
+  const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>
+  return b.tools ? JSON.stringify(b.tools) : ''
+}
+
+function ccPositions(blocks: SysBlock[]): string {
+  return blocks.map((bk, i) => (bk.hasCC ? i : -1)).filter(i => i >= 0).join(',')
+}
+
+function detectBreaker(sessionKey: string, prev: CaptureEntry, cur: CaptureEntry): CacheBreaker {
+  const pb = systemBlocks(prev.body)
+  const cb = systemBlocks(cur.body)
+  const base = { sessionKey, prevSeq: prev.meta.seq, curSeq: cur.meta.seq }
+  if (pb.length !== cb.length) {
+    return { ...base, reason: 'system_blocks_count_changed', detail: { prevSha: String(pb.length), curSha: String(cb.length) } }
+  }
+  for (let i = 0; i < pb.length; i++) {
+    const ps = sha12(pb[i].text), cs = sha12(cb[i].text)
+    if (ps !== cs) {
+      return { ...base, reason: 'system_block_changed', detail: { changedBlockIndex: i, prevSha: ps, curSha: cs, snippet: cb[i].text.slice(0, 200) } }
+    }
+  }
+  if (toolsSig(prev.body) !== toolsSig(cur.body)) {
+    return { ...base, reason: 'tools_changed', detail: {} }
+  }
+  if (ccPositions(pb) !== ccPositions(cb)) {
+    return { ...base, reason: 'cache_control_moved', detail: {} }
+  }
+  return { ...base, reason: 'unknown', detail: {} }
+}
+
 export function analyzeCaptures(entries: CaptureEntry[], win: AnalyzeWindow): CaptureReport {
   const sorted = [...entries].sort((a, b) => a.meta.ts - b.meta.ts || a.meta.seq - b.meta.seq)
 
@@ -119,13 +171,23 @@ export function analyzeCaptures(entries: CaptureEntry[], win: AnalyzeWindow): Ca
   const denom = cacheReadTokens + cacheCreateTokens + freshInputTokens
   const cacheHitRate = denom ? cacheReadTokens / denom : 0
 
+  const breakers: CacheBreaker[] = []
+  for (const list of groups.values()) {
+    for (let i = 1; i < list.length; i++) {
+      const prev = list[i - 1], cur = list[i]
+      if (cur.meta.usage.cacheReadTokens === 0) {
+        breakers.push(detectBreaker(keyOf(cur), prev, cur))
+      }
+    }
+  }
+
   return {
     captureId: win.captureId,
     apiKeyId: win.apiKeyId,
     window: { startedAt: win.startedAt, endedAt: win.endedAt, stoppedReason: win.stoppedReason },
     totals: { requests: sorted.length, cacheReadTokens, cacheCreateTokens, freshInputTokens, cacheHitRate, credits, byModel },
     sessions,
-    breakers: [],
+    breakers,
     configWarnings: []
   }
 }
