@@ -3515,12 +3515,18 @@ export class ProxyServer {
     const entry = this.sessionAffinity.get(sessionHint)
     if (entry) {
       const account = this.accountPool.getAccount(entry.accountId)
-      // 校验账号仍可用且未被封禁
-      if (account && !this.accountPool.isSuspended(account) && account.isAvailable !== false) {
+      // 校验账号仍可用、未被封禁、且未配额耗尽
+      // （配额检查与 getNextAccount 对齐：否则粘住的账号月度限额用满后仍被复用，导致 402）
+      if (
+        account &&
+        !this.accountPool.isSuspended(account) &&
+        account.isAvailable !== false &&
+        !this.accountPool.isQuotaExhausted(account)
+      ) {
         entry.lastAt = Date.now()
         return account
       }
-      // 已失效 → 清掉粘性
+      // 已失效（不可用 / 熔断 / 配额耗尽）→ 清掉粘性，回退到正常轮询另选账号
       this.sessionAffinity.delete(sessionHint)
     }
     return null
