@@ -698,6 +698,11 @@ const api = {
     return () => ipcRenderer.off('proxy-webhook-trigger', handler)
   },
 
+  /** 通过主进程发送 webhook HTTP 请求（绕过渲染进程 CORS：飞书/钉钉等 hook 不回 CORS 头） */
+  webhookSend: (req: { url: string; body: unknown; timeoutMs?: number }): Promise<{ ok: boolean; status: number; body: string; error?: string }> => {
+    return ipcRenderer.invoke('webhook-send', req)
+  },
+
   // 添加账号到反代池
   proxyAddAccount: (account: { id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }): Promise<{ success: boolean; accountCount?: number; error?: string }> => {
     return ipcRenderer.invoke('proxy-add-account', account)

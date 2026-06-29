@@ -636,6 +636,7 @@ interface KiroApi {
   proxyRestart: () => Promise<{ success: boolean; error?: string }>
   proxyAuditLog: () => Promise<{ entries: Array<{ ts: number; type: string; data: Record<string, unknown> }> }>
   onProxyWebhookTrigger: (callback: (event: string, payload: Record<string, unknown>) => void) => (() => void)
+  webhookSend: (req: { url: string; body: unknown; timeoutMs?: number }) => Promise<{ ok: boolean; status: number; body: string; error?: string }>
 
   // 添加账号到反代池
   proxyAddAccount: (account: { id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }) => Promise<{ success: boolean; accountCount?: number; error?: string }>

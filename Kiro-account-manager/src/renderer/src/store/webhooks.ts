@@ -200,6 +200,45 @@ function checkAndRecordRate(webhookId: string): boolean {
 }
 
 /**
+ * 校验「HTTP 200 但业务层失败」的情况。
+ * 飞书 / 钉钉 / 企微 / Telegram 即使配置错误（安全设置、IP 白名单、关键词等）
+ * 也返回 HTTP 200，真实成败在响应体的 code/errcode 字段里。只看 resp.ok 会把
+ * 这些失败误判成功（"测试成功"假阳性）。
+ * 返回 null = 成功；返回字符串 = 失败原因（含错误码，便于定位）。
+ */
+function parseProviderBizError(kind: WebhookKind, bodyText: string): string | null {
+  // Discord 成功返回 204 无 body；custom 模板无统一约定 —— 不解析
+  if (kind === 'discord' || kind === 'custom') return null
+  let data: Record<string, unknown>
+  try {
+    if (!bodyText) return null
+    data = JSON.parse(bodyText) as Record<string, unknown>
+  } catch {
+    return null // 非 JSON 响应，无法判定，按 HTTP 成功处理
+  }
+  switch (kind) {
+    case 'feishu': {
+      // 成功：code===0（新版）或 StatusCode===0（旧版）；缺字段也按成功
+      const code = (data.code ?? data.StatusCode) as number | undefined
+      if (code === 0 || code === undefined) return null
+      return `飞书拒绝 code=${code} msg=${(data.msg ?? data.StatusMessage ?? '') as string}`
+    }
+    case 'dingtalk':
+    case 'wechat-work': {
+      const errcode = data.errcode as number | undefined
+      if (errcode === 0 || errcode === undefined) return null
+      return `${kind} 拒绝 errcode=${errcode} errmsg=${(data.errmsg ?? '') as string}`
+    }
+    case 'telegram': {
+      if (data.ok === true) return null
+      return `Telegram 拒绝 code=${(data.error_code ?? '') as string} desc=${(data.description ?? '') as string}`
+    }
+    default:
+      return null
+  }
+}
+
+/**
  * 按 webhook 类型构造消息体并 POST（含重试 + 速率限制）
  * 网络错误不会抛到调用方（仅 console.warn），避免影响主业务流程
  */
@@ -224,32 +263,39 @@ async function sendWebhook(webhook: WebhookEntry, payload: WebhookMessage): Prom
       console.log(`[Webhook] Retry ${attempt}/${RETRY_COUNT} for ${webhook.kind} ${webhook.label || webhook.id}`)
     }
     try {
-      const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), 8000)
-      const resp = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: controller.signal
-      })
-      clearTimeout(timer)
+      // 经主进程发送，绕开渲染进程 CORS（飞书/钉钉等 hook 不回 CORS 头，渲染进程直发会 "Failed to fetch"）
+      const resp = await window.api.webhookSend({ url, body, timeoutMs: 8000 })
       if (resp.ok) {
-        if (attempt > 0) {
-          console.log(`[Webhook] ${webhook.kind} ${webhook.label || webhook.id} succeeded on retry ${attempt}`)
+        // HTTP 通了还要看业务层是否真的接受（飞书/钉钉/企微/TG 用响应体 code 表示成败）
+        const bizErr = parseProviderBizError(webhook.kind, resp.body)
+        if (!bizErr) {
+          if (attempt > 0) {
+            console.log(`[Webhook] ${webhook.kind} ${webhook.label || webhook.id} succeeded on retry ${attempt}`)
+          }
+          return
         }
-        return
+        // 业务层拒绝（安全设置/IP 白名单/关键词等），重试无意义，直接结束
+        lastError = new Error(bizErr)
+        break
       }
-      // 4xx 客户端错误（除 408/429）不重试
-      if (resp.status >= 400 && resp.status < 500 && resp.status !== 408 && resp.status !== 429) {
-        console.warn(`[Webhook] ${webhook.kind} ${webhook.label || webhook.id} HTTP ${resp.status} (no retry)`)
-        return
+      // status=0 = 主进程网络层失败（含超时），可重试
+      if (resp.status === 0) {
+        lastError = new Error(resp.error || 'Network error')
+      } else if (resp.status >= 400 && resp.status < 500 && resp.status !== 408 && resp.status !== 429) {
+        // 4xx 客户端错误（除 408/429）不重试
+        lastError = new Error(`HTTP ${resp.status}`)
+        break
+      } else {
+        lastError = new Error(`HTTP ${resp.status}`)
       }
-      lastError = new Error(`HTTP ${resp.status}`)
     } catch (err) {
       lastError = err
     }
   }
-  console.warn(`[Webhook] ${webhook.kind} ${webhook.label || webhook.id} failed after ${RETRY_COUNT} retries:`, lastError)
+  // 最终失败：抛出让调用方（测试按钮 / allSettled 事件流）能看到真实原因，不再静默吞掉
+  const reason = lastError instanceof Error ? lastError.message : String(lastError)
+  console.warn(`[Webhook] ${webhook.kind} ${webhook.label || webhook.id} failed: ${reason}`)
+  throw lastError instanceof Error ? lastError : new Error(reason)
 }
 
 function buildTelegramUrl(webhook: WebhookEntry): string {

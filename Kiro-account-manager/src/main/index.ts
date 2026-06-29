@@ -6519,6 +6519,30 @@ app.whenReady().then(async () => {
     }
   })
 
+  // Webhook 发送：在主进程发 HTTP，绕开渲染进程的 CORS（飞书/钉钉/企微等 hook 接口不回 CORS 头，
+  // 渲染进程 fetch 会直接 "Failed to fetch"）。仅做转发，不解析业务码（由 renderer 按类型判定）。
+  ipcMain.handle('webhook-send', async (_event, req: { url: string; body: unknown; timeoutMs?: number }) => {
+    if (!req?.url || typeof req.url !== 'string') {
+      return { ok: false, status: 0, body: '', error: 'Invalid webhook url' }
+    }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), req.timeoutMs ?? 8000)
+    try {
+      const resp = await fetch(req.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req.body),
+        signal: controller.signal
+      })
+      const text = await resp.text().catch(() => '')
+      return { ok: resp.ok, status: resp.status, body: text }
+    } catch (error) {
+      return { ok: false, status: 0, body: '', error: error instanceof Error ? error.message : String(error) }
+    } finally {
+      clearTimeout(timer)
+    }
+  })
+
   ipcMain.handle('proxy-configure-clients', async (_event, input: { clients: ProxyClientTarget[]; modelId: string; modelName?: string; models?: ProxyClientModel[] }) => {
     try {
       const server = initProxyServer()
