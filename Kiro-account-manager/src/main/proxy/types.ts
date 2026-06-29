@@ -693,6 +693,7 @@ export interface RequestLog {
   path: string
   model: string
   accountId: string
+  apiKeyId?: string // 调用方使用的对外 API Key id（老式单 key 为 LEGACY_API_KEY_ID；匿名/未知为空）
   clientIP?: string // 来源 IP（socket 远端地址，已去 ::ffff: 前缀）
   inputTokens: number
   outputTokens: number

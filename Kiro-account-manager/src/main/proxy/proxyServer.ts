@@ -2072,6 +2072,8 @@ export class ProxyServer {
       uptime: Date.now() - stats.startTime,
       startTime: stats.startTime,
       accountStats,
+      // 维度统计：(API Key × 接入 IP × 模型) 组合明细，外部可按 cell.apiKeyId 过滤/聚合到某个 key
+      dimensionStats: stats.dimensionStats,
       recentRequests: stats.recentRequests.slice(-50)
     }))
   }
@@ -3935,12 +3937,14 @@ export class ProxyServer {
     success: boolean
     error?: string
   }): void {
+    const store = this.requestContext.getStore()
     this.stats.recentRequests.push({
       timestamp: Date.now(),
       path: log.path,
       model: log.model || 'unknown',
       accountId: log.accountId || 'unknown',
-      clientIP: this.requestContext.getStore()?.clientIP || 'unknown',
+      apiKeyId: store?.apiKeyId,
+      clientIP: store?.clientIP || 'unknown',
       inputTokens: log.inputTokens || 0,
       outputTokens: log.outputTokens || 0,
       credits: log.credits,
