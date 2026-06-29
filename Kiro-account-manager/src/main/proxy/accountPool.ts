@@ -355,9 +355,10 @@ export class AccountPool {
   }
 
   // 记录请求失败（区分错误类型）
-  recordError(accountId: string, errorType: ErrorType = ErrorType.RECOVERABLE, statusCode?: number): void {
+  // 返回值：本次是否使该账号"新近"进入配额耗尽状态（用于触发账号池报警，避免重复推送）
+  recordError(accountId: string, errorType: ErrorType = ErrorType.RECOVERABLE, statusCode?: number): boolean {
     const account = this.accounts.get(accountId)
-    if (!account) return
+    if (!account) return false
 
     const now = Date.now()
     const stats = this.accountStats.get(accountId)
@@ -366,12 +367,15 @@ export class AccountPool {
     }
 
     // FATAL 错误不增加失败计数（是请求的问题，不是账号的问题）
-    if (errorType === ErrorType.FATAL) return
+    if (errorType === ErrorType.FATAL) return false
 
     // RECOVERABLE: 增加失败计数，断路器指数退避自动生效
     const errorCount = (account.errorCount || 0) + 1
     let quotaExhaustedAt = account.quotaExhaustedAt
     let quotaResetAt = account.quotaResetAt
+
+    // 记录调用前是否已耗尽，用于判断本次是否为"新近耗尽"的状态转变
+    const wasExhausted = this.isQuotaExhausted(account, now)
 
     // 配额类错误额外标记耗尽，并按配置的 quotaResetMs 设定自动恢复时间。
     // 否则 quotaExhaustedAt 一直 > 0，isQuotaExhausted 永远为 true，
@@ -401,6 +405,9 @@ export class AccountPool {
       quotaResetAt,
       lastUsed: now
     })
+
+    // 仅在"配额错误 + 之前未耗尽 + 现在耗尽"时返回 true（新近耗尽）
+    return isQuotaError && !wasExhausted
   }
 
   // 更新账号配额信息

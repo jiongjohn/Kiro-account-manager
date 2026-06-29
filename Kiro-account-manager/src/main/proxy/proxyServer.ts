@@ -16,6 +16,7 @@ import type {
   ClaudeCacheControl,
   ProxyConfig,
   ProxyStats,
+  DimensionStat,
   ProxyAccount,
   TokenRefreshCallback
 } from './types'
@@ -380,6 +381,7 @@ export class ProxyServer {
       accountStats: new Map(),
       endpointStats: new Map(),
       modelStats: new Map(),
+      dimensionStats: { byApiKey: {}, byClientIP: {}, byModel: {} },
       recentRequests: []
     }
     this.sessionStats = {
@@ -856,6 +858,7 @@ export class ProxyServer {
       accountStats: this.stats.accountStats,
       endpointStats: this.stats.endpointStats,
       modelStats: this.stats.modelStats,
+      dimensionStats: this.stats.dimensionStats,
       recentRequests: this.stats.recentRequests
     }
   }
@@ -1474,7 +1477,10 @@ export class ProxyServer {
         // 402/429: 额度耗尽，切换端点或账号
         if (errMsg.includes('402') || errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('ThrottlingException') || errMsg.includes('reached the limit') || errMsg.includes('ServiceQuotaExceededException') || errMsg.includes('limit exceeded') || errMsg.includes('rate limit')) {
           console.log('[ProxyServer] Quota/throttle error, switching endpoint or account')
-          this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
+          const newlyExhausted = this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
+          if (newlyExhausted) {
+            this.notifyAccountQuotaExhausted(currentAccount, _path)
+          }
           endpointIndex = (endpointIndex + 1) % 2 // 切换端点
           if (endpointIndex === 0) {
             // 已尝试所有端点，切换到没试过的下个账号
@@ -1753,6 +1759,47 @@ export class ProxyServer {
 
     // 触发配置保存事件
     this.events.onConfigChanged?.(this.config)
+
+    // 用量报警：totalCredits 达到 creditsLimit 的阈值（默认 90%）时推送一次 webhook
+    this.checkUsageAlert(apiKey)
+  }
+
+  /**
+   * API Key 用量报警：当 totalCredits / creditsLimit 达到阈值时通过 webhook 推送。
+   * - 阈值优先取 apiKey.usageAlertThreshold，否则取全局 config.usageAlertThreshold，默认 0.9。
+   * - 阈值 <= 0 表示关闭报警。
+   * - 借助 triggerWebhook 的 5 分钟去重，避免同一 Key 反复推送。
+   */
+  private checkUsageAlert(apiKey: import('./types').ApiKey): void {
+    const limit = apiKey.creditsLimit
+    if (!limit || limit <= 0) return  // 无额度上限，不报警
+
+    const threshold = apiKey.usageAlertThreshold ?? this.config.usageAlertThreshold ?? 0.9
+    if (threshold <= 0) return  // 关闭报警
+
+    const used = apiKey.usage.totalCredits
+    const ratio = used / limit
+    if (ratio < threshold) return  // 未达阈值
+
+    const percent = Math.min(100, Math.round(ratio * 100))
+    const reached = ratio >= 1
+    // 按 key 去重：100% 与阈值各推一次（事件名带 key id + 是否超限）
+    this.triggerWebhook(`proxy-usage-warning-${apiKey.id}-${reached ? 'exceeded' : 'threshold'}`, {
+      title: reached ? `API Key 额度已用尽：${apiKey.name}` : `API Key 用量告警：${apiKey.name}`,
+      message: reached
+        ? `API Key「${apiKey.name}」已用完配额（${used.toFixed(2)}/${limit} credits, ${percent}%）。`
+        : `API Key「${apiKey.name}」用量已达 ${percent}%（${used.toFixed(2)}/${limit} credits），接近上限。`,
+      level: reached ? 'error' : 'warn',
+      // 标记为用量报警事件，供 renderer 映射到 'usage-warning' webhook 事件
+      kind: 'usage-warning',
+      fields: {
+        'API Key': apiKey.name,
+        已用: `${used.toFixed(2)} credits`,
+        上限: `${limit} credits`,
+        使用率: `${percent}%`,
+        总请求: apiKey.usage.totalRequests
+      }
+    })
   }
 
   // 应用模型映射
@@ -2922,7 +2969,8 @@ export class ProxyServer {
 
           this.recordRequestFailed()
           const errStatusCode = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode ? classifyError(parseInt(errStatusCode)) : ErrorType.RECOVERABLE, errStatusCode ? parseInt(errStatusCode) : undefined)
+          const oaiNewlyExhausted = this.accountPool.recordError(account.id, errStatusCode ? classifyError(parseInt(errStatusCode)) : ErrorType.RECOVERABLE, errStatusCode ? parseInt(errStatusCode) : undefined)
+          if (oaiNewlyExhausted) this.notifyAccountQuotaExhausted(account, '/v1/chat/completions', model)
           this.emitResponse({ path: '/v1/chat/completions', model, status: 500, error: error.message })
           this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
@@ -3343,7 +3391,8 @@ export class ProxyServer {
 
           this.recordRequestFailed()
           const errStatusCode2 = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
+          const claudeNewlyExhausted = this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
+          if (claudeNewlyExhausted) this.notifyAccountQuotaExhausted(account, '/v1/messages', model)
           this.emitResponse({ path: '/v1/messages', model, status: 500, error: error.message })
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
@@ -3373,7 +3422,11 @@ export class ProxyServer {
     const errorType = classifyError(parsedCode)
     const isAuthError = error.message.includes('401') || error.message.includes('403') || error.message.includes('Auth')
 
-    this.accountPool.recordError(account.id, errorType, parsedCode)
+    const newlyExhausted = this.accountPool.recordError(account.id, errorType, parsedCode)
+    if (newlyExhausted) {
+      const fullAccount = this.accountPool.getAccount(account.id)
+      if (fullAccount) this.notifyAccountQuotaExhausted(fullAccount, path, model)
+    }
 
     let statusCode = parsedCode
     if (isAuthError) statusCode = 401
@@ -3624,6 +3677,63 @@ export class ProxyServer {
     })
   }
 
+  /**
+   * 单账号配额耗尽时的账号池报警（在 recordError 返回"新近耗尽"为 true 时调用）。
+   * 根据 config.accountPoolAlertMode 决定推送时机：
+   * - 'off'：不推送
+   * - 'each'：每个账号耗尽各推一次（按账号 ID 去重）
+   * - 'threshold'：仅当可用账号占比降到阈值（默认 10%）及以下时推一次
+   * 全员耗尽（available=0）由 notifyAllAccountsExhausted 单独处理，这里跳过避免重复。
+   */
+  private notifyAccountQuotaExhausted(account: ProxyAccount, path: string, model?: string): void {
+    const mode = this.config.accountPoolAlertMode ?? 'threshold'
+    if (mode === 'off') return
+
+    const quota = this.accountPool.getQuotaStatus()
+    // 全员不可用交给 notifyAllAccountsExhausted，这里不重复推
+    if (quota.available <= 0) return
+
+    const emailShort = account.email || account.id.slice(0, 8)
+    this.appendAuditLog('account_quota_exhausted', { accountId: account.id, email: account.email, path, model, ...quota })
+
+    if (mode === 'each') {
+      // 每个账号各推一次：事件名带账号 ID 去重
+      this.triggerWebhook(`proxy-account-quota-${account.id}`, {
+        title: '反代账号配额耗尽',
+        message: `账号 ${emailShort} 配额耗尽（429/402），已自动切换。当前可用 ${quota.available}/${quota.total}。`,
+        level: 'warn',
+        kind: 'account-pool-warning',
+        fields: { 邮箱: account.email || '-', 账号ID: account.id.slice(0, 8), 端点: path, 模型: model || '-', 可用账号: quota.available, 总账号: quota.total, 配额耗尽: quota.exhausted }
+      })
+      return
+    }
+
+    // threshold 模式：可用占比 <= 阈值才推
+    const threshold = this.config.accountPoolAlertThreshold ?? 0.1
+    if (quota.total <= 0) return
+    const availableRatio = quota.available / quota.total
+    if (availableRatio > threshold) return
+
+    const percent = Math.round(availableRatio * 100)
+    // 列出当前所有已耗尽账号（邮箱优先，无邮箱用 id 前缀），方便排查
+    const now = Date.now()
+    const exhaustedAccounts = this.accountPool.getAllAccounts()
+      .filter(a => this.accountPool.isQuotaExhausted(a, now))
+      .map(a => a.email || a.id.slice(0, 8))
+    const MAX_LIST = 20
+    const exhaustedList = exhaustedAccounts.length > MAX_LIST
+      ? `${exhaustedAccounts.slice(0, MAX_LIST).join('、')} 等 ${exhaustedAccounts.length} 个`
+      : (exhaustedAccounts.join('、') || '-')
+    // 事件名不带账号 ID：同一"低水位"窗口内只推一次（5 分钟去重）
+    this.triggerWebhook('proxy-account-pool-low', {
+      title: '反代账号池即将耗尽',
+      message: `可用账号已降至 ${quota.available}/${quota.total}（${percent}%），低于报警阈值 ${Math.round(threshold * 100)}%。最近耗尽账号：${emailShort}。`,
+      level: 'error',
+      kind: 'account-pool-warning',
+      fields: { 可用账号: quota.available, 总账号: quota.total, 可用占比: `${percent}%`, 报警阈值: `${Math.round(threshold * 100)}%`, 配额耗尽: quota.exhausted, 冷却中: quota.cooldown, 已耗尽账号: exhaustedList }
+    })
+  }
+
   /** P2-16 Prometheus metrics 文本 */
   private renderPrometheusMetrics(): string {
     const s = this.stats
@@ -3729,9 +3839,63 @@ export class ProxyServer {
 
   // onResponse 统一出口：自动注入当前请求的来源 IP（来自 AsyncLocalStorage），供 UI 实时日志展示
   private emitResponse(info: Parameters<NonNullable<ProxyServerEvents['onResponse']>>[0]): void {
-    const withIp = { ...info, clientIP: info.clientIP ?? this.requestContext.getStore()?.clientIP }
+    const store = this.requestContext.getStore()
+    const withIp = { ...info, clientIP: info.clientIP ?? store?.clientIP }
+    // 维度统计：按 API Key / 来源 IP / 模型聚合（含缓存命中率明细）
+    this.recordDimensionStats(withIp, store?.apiKeyId)
     this.events.onResponse?.(withIp)
     this.captureIfActive(withIp)
+  }
+
+  /**
+   * 维度统计聚合：在 emitResponse 内对每个响应按三个维度累加。
+   * - byApiKey：apiKeyId（多 key 用 id，老式单 key 为 LEGACY_API_KEY_ID）
+   * - byClientIP：socket 来源 IP
+   * - byModel：请求模型
+   * 缓存命中率 = cacheReadTokens / (inputTokens + cacheReadTokens + cacheWriteTokens)，由 UI 计算。
+   */
+  private recordDimensionStats(
+    info: Parameters<NonNullable<ProxyServerEvents['onResponse']>>[0],
+    apiKeyId?: string
+  ): void {
+    const success = info.status >= 200 && info.status < 300
+    const accumulate = (table: Record<string, DimensionStat>, key: string | undefined, label?: string): void => {
+      if (!key) return
+      let stat = table[key]
+      if (!stat) {
+        stat = {
+          key,
+          label,
+          requests: 0,
+          successRequests: 0,
+          failedRequests: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          credits: 0,
+          lastUsed: 0
+        }
+        table[key] = stat
+      }
+      if (label) stat.label = label
+      stat.requests++
+      if (success) stat.successRequests++
+      else stat.failedRequests++
+      stat.inputTokens += info.inputTokens || 0
+      stat.outputTokens += info.outputTokens || 0
+      stat.cacheReadTokens += info.cacheReadTokens || 0
+      stat.cacheWriteTokens += info.cacheWriteTokens || 0
+      stat.credits += info.credits || 0
+      stat.lastUsed = Date.now()
+    }
+
+    const keyLabel = apiKeyId
+      ? (apiKeyId === LEGACY_API_KEY_ID ? '默认 Key' : this.config.apiKeys?.find(k => k.id === apiKeyId)?.name)
+      : undefined
+    accumulate(this.stats.dimensionStats.byApiKey, apiKeyId, keyLabel)
+    accumulate(this.stats.dimensionStats.byClientIP, info.clientIP || undefined)
+    accumulate(this.stats.dimensionStats.byModel, info.model || undefined)
   }
 
   // 记录请求到 recentRequests

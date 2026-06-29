@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
-import { Play, Square, RefreshCw, Copy, Check, Server, Activity, AlertCircle, Globe, Zap, Loader2, FileText, Eye, EyeOff, Dices, Cpu, UserCheck, RotateCcw, Users, Clock, Settings2 } from 'lucide-react'
+import { Play, Square, RefreshCw, Copy, Check, Server, Activity, AlertCircle, Globe, Zap, Loader2, FileText, Eye, EyeOff, Dices, Cpu, UserCheck, RotateCcw, Users, Clock, Settings2, BarChart3 } from 'lucide-react'
 import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Label, Switch, Badge, Select } from '../ui'
 import { ProxySecurityPanel } from './ProxySecurityPanel'
 import { useAccountsStore } from '../../store/accounts'
@@ -7,6 +7,7 @@ import { useTranslation } from '../../hooks/useTranslation'
 import { ProxyLogsDialog } from './ProxyLogsDialog'
 import { ProxyCaptureDialog } from './ProxyCaptureDialog'
 import { ProxyDetailedLogsDialog } from './ProxyDetailedLogsDialog'
+import { DimensionStatsDialog, type DimensionStats } from './DimensionStatsDialog'
 import { ModelsDialog } from './ModelsDialog'
 import { ModelMappingDialog } from './ModelMappingDialog'
 import { AccountSelectDialog } from './AccountSelectDialog'
@@ -33,6 +34,7 @@ interface ProxyStats {
   cacheWriteTokens?: number
   reasoningTokens?: number
   startTime: number
+  dimensionStats?: DimensionStats
 }
 
 interface SessionStats {
@@ -101,6 +103,9 @@ interface ProxyConfig {
   enableMetrics?: boolean
   fallbackPort?: number
   enableAuditLog?: boolean
+  usageAlertThreshold?: number
+  accountPoolAlertMode?: 'off' | 'each' | 'threshold'
+  accountPoolAlertThreshold?: number
 }
 
 // 反代请求日志：模块级持久化 + 单次订阅，避免切到其它页面 unmount 后日志清空、中间请求事件丢失
@@ -166,6 +171,7 @@ export function ProxyPanel() {
   const [showLogsDialog, setShowLogsDialog] = useState(false)
   const [showCaptureDialog, setShowCaptureDialog] = useState(false)
   const [showDetailedLogsDialog, setShowDetailedLogsDialog] = useState(false)
+  const [showDimensionStatsDialog, setShowDimensionStatsDialog] = useState(false)
   const [showModelsDialog, setShowModelsDialog] = useState(false)
   const [showClientConfigDialog, setShowClientConfigDialog] = useState(false)
   const [showModelMappingDialog, setShowModelMappingDialog] = useState(false)
@@ -1383,6 +1389,10 @@ export function ProxyPanel() {
                   <Activity className="h-3 w-3 mr-1" />
                   {isEn ? 'Detailed Logs' : '详细日志'}
                 </Button>
+                <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowDimensionStatsDialog(true)}>
+                  <BarChart3 className="h-3 w-3 mr-1" />
+                  {isEn ? 'Stats' : '维度统计'}
+                </Button>
                 <Button variant="outline" size="sm" onClick={() => setShowCaptureDialog(true)}>
                   {isEn ? 'Capture' : '抓包分析'}
                 </Button>
@@ -1476,6 +1486,13 @@ export function ProxyPanel() {
           await window.api.proxyResetTokens()
           fetchStatus()
         }}
+        isEn={isEn}
+      />
+
+      <DimensionStatsDialog
+        open={showDimensionStatsDialog}
+        onOpenChange={setShowDimensionStatsDialog}
+        dimensionStats={stats?.dimensionStats as DimensionStats | undefined}
         isEn={isEn}
       />
 
