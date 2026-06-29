@@ -124,7 +124,15 @@ function App(): React.JSX.Element {
           'proxy-account-suspended': 'account-banned',
           'proxy-all-exhausted': 'risk-warning'
         }
-        const targetEvent = webhookEventMap[event] || 'risk-warning'
+        // 用量报警事件名形如 proxy-usage-warning-<keyId>-<threshold|exceeded>，
+        // payload.kind 标记具体类型（usage-warning / account-pool-warning）
+        const payloadKind = (payload as { kind?: string })?.kind
+        const targetEvent: 'risk-warning' | 'account-banned' | 'usage-warning' | 'account-pool-warning' =
+          payloadKind === 'usage-warning'
+            ? 'usage-warning'
+            : payloadKind === 'account-pool-warning'
+              ? 'account-pool-warning'
+              : (webhookEventMap[event] || 'risk-warning')
         // 规范化 level（main 用 'error'/'info' 等字符串字面量，需要映射到 store 接受的类型）
         const rawLevel = (payload as { level?: string })?.level
         const level: 'info' | 'warn' | 'error' | 'success' =
