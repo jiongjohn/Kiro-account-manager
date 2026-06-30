@@ -89,14 +89,22 @@ function sha12(s: string): string {
 
 interface SysBlock { text: string; hasCC: boolean }
 
+// 与 translator.ts:stripBillingHeader 保持一致：Claude Code 注入的 x-anthropic-billing-header
+// 行（cch 每请求变化）在转发 Kiro 前已被剥离，故分析缓存断点时也必须先剥掉，
+// 否则会把"本就会被剥掉、不影响 Kiro 缓存"的 billing 行误报成 system[0] 断裂点。
+function stripBillingHeader(text: string): string {
+  return text.replace(/^\s*x-anthropic-billing-header:[^\n]*\r?\n?/i, '')
+}
+
 function systemBlocks(body: unknown): SysBlock[] {
   const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>
   const sys = b.system
-  if (typeof sys === 'string') return [{ text: sys, hasCC: false }]
+  if (typeof sys === 'string') return [{ text: stripBillingHeader(sys), hasCC: false }]
   if (Array.isArray(sys)) {
     return sys.map(x => {
       const o = (x && typeof x === 'object' ? x : {}) as Record<string, unknown>
-      return { text: typeof o.text === 'string' ? o.text : JSON.stringify(o), hasCC: !!o.cache_control }
+      const raw = typeof o.text === 'string' ? o.text : JSON.stringify(o)
+      return { text: stripBillingHeader(raw), hasCC: !!o.cache_control }
     })
   }
   return []

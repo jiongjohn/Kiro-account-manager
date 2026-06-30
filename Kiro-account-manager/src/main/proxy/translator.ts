@@ -311,14 +311,17 @@ function stripBillingHeader(text: string): string {
   return text.replace(/^\s*x-anthropic-billing-header:[^\n]*\r?\n?/i, '')
 }
 
-// 把当前时间注入到「当前消息」（最后一条 user 消息）而非 system prompt。
-// 背景：Bedrock/Kiro 是前缀缓存（tools → system → messages）。system prompt 是被缓存的大前缀块，
-// 若把每请求都变的时间戳贴在它最前面，会让 system 块指纹每次都变、连带其后的全部对话历史都无法命中，
-// 命中率被死死压在「仅 tools 命中」那一档（实测 ~43%）。当前消息是最新一轮内容、本就不参与前缀缓存，
-// 在这里注入时间戳零缓存代价，模型也仍能感知当前时间。
+// 当前消息内容透传——不再注入每请求变化的时间戳。
+//
+// 背景（v1.7.14 修复）：曾把"[Context: Current time is <ISO>]"注入到当前消息，
+// 以为当前消息不参与前缀缓存。但当前消息带有 cachePoint（会被 Bedrock 缓存），
+// 且这一轮的当前消息下一轮会原样进入 history——而 history 版本里没有这段时间戳前缀。
+// 于是缓存段末尾每轮都对不上，Bedrock 无法复用、每轮全量重写，prompt cache 命中率被
+// 死死压在 0%（线上抓包 + 116 实测两轮 replay 已字节级定位：去掉时间戳后当前消息与
+// 下一轮 history 中的同条消息逐字相同）。
+// 模型的当前时间由客户端自身的环境上下文提供，无需代理注入。
 function prependTimeContext(content: string): string {
-  const timestamp = new Date().toISOString()
-  return `[Context: Current time is ${timestamp}]\n\n${content}`
+  return content
 }
 
 // ============ OpenAI -> Kiro 转换 ============
