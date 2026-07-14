@@ -1083,6 +1083,13 @@ export class ProxyServer {
     if (!model) return undefined
     const schema = extractThinkingSchema(model.additionalModelRequestFieldsSchema)
     if (!schema?.schemaPath || !schema.efforts?.length) return undefined
+    // 只有 output_config 路径（Claude 4.6+）才真正通过 additionalModelRequestFields 接受 thinking。
+    // reasoning 路径是 Kiro 的 gpt-5.6-* 变体：它们在 additionalModelRequestFieldsSchema 里声明了
+    // reasoning 字段（于是 extractThinkingSchema 命中 'reasoning'），但后端并不接受
+    // additionalModelRequestFields，注入会被 400 "additionalModelRequestFields is not supported
+    // for this model" 拒绝（对应 /v1/models 里这些模型 supportsThinking=false）。它们的推理档位
+    // 由 Kiro 服务端按模型变体处理，代理不应注入。因此这里仅放行 output_config。
+    if (schema.schemaPath !== 'output_config') return undefined
     return { schemaPath: schema.schemaPath, efforts: schema.efforts }
   }
 

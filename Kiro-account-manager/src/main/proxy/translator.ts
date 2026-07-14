@@ -10,6 +10,7 @@ import type {
   OpenAIResponsesResponse,
   OpenAIResponseContentPart,
   OpenAIResponseOutputItem,
+  OpenAIResponsesTool,
   ClaudeRequest,
   ClaudeMessage,
   ClaudeResponse,
@@ -53,14 +54,13 @@ function buildThinkingFields(
   // 客户端明确关闭 thinking
   if (clientThinking?.type === 'disabled') return undefined
 
-  // 没有模型元数据时，回退到旧逻辑：仅传 { thinking: { type: 'adaptive' } }
+  // 没有模型元数据（模型不支持思考，或模型列表尚未加载）时，无法确认该模型是否
+  // 接受 additionalModelRequestFields。历史逻辑会盲目注入 { thinking: { type: 'adaptive' } }，
+  // 但对不支持思考的模型（如 claude-haiku-4.5 / sonnet-4.5 / 3.7-sonnet 及非 Claude 模型）
+  // 会被 Kiro 后端以 400 "additionalModelRequestFields is not supported for this model" 拒绝。
+  // 因此这里不再注入，交由 Kiro 走该模型的默认行为；仅当 getThinkingConfig 明确解析出
+  // 模型的 thinking schema（thinkingConfig 存在）时才注入。
   if (!thinkingConfig) {
-    if (clientThinking && clientThinking.type !== 'disabled') {
-      return { thinking: { type: 'adaptive' } }
-    }
-    if (clientReasoningEffort) {
-      return { thinking: { type: 'adaptive' } }
-    }
     return undefined
   }
 
@@ -130,6 +130,12 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
   }
 
   const messages: OpenAIMessage[] = []
+  // Responses Lite（gpt-5.6-sol 等）把工具塞进 input 的 additional_tools 条目并省略顶层 tools，
+  // 这里统一收集：顶层 request.tools + 各 additional_tools 条目的 tools。
+  const collectedResponsesTools: OpenAIResponsesTool[] = []
+  if (Array.isArray(request.tools)) {
+    collectedResponsesTools.push(...(request.tools as unknown as OpenAIResponsesTool[]))
+  }
   if (request.instructions) {
     messages.push({ role: 'system', content: request.instructions })
   }
@@ -141,7 +147,43 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
     }
     for (const item of request.input) {
       const itemType = item.type as string | undefined
-      if (itemType === 'function_call_output') {
+      if (itemType === 'additional_tools') {
+        if (Array.isArray(item.tools)) {
+          collectedResponsesTools.push(...item.tools)
+        }
+      } else if (itemType === 'reasoning') {
+        // codex 多轮会回传上一轮的（加密/不透明）reasoning 条目，Kiro 无法消费，直接跳过。
+      } else if (itemType === 'custom_tool_call') {
+        // custom 工具（如 exec）调用：入参是自由文本 input，包装成 function 的 { input } 参数，
+        // 与 convertResponsesTool 里把 custom 工具降级为单 input function 的做法一致。
+        if (!item.call_id) {
+          throw new Error('custom_tool_call requires call_id')
+        }
+        if (!item.name) {
+          throw new Error('custom_tool_call requires name')
+        }
+        messages.push({
+          role: 'assistant',
+          content: '',
+          tool_calls: [{
+            id: item.call_id,
+            type: 'function',
+            function: {
+              name: item.name,
+              arguments: JSON.stringify({ input: item.input ?? '' })
+            }
+          }]
+        })
+      } else if (itemType === 'custom_tool_call_output') {
+        if (!item.call_id) {
+          throw new Error('custom_tool_call_output requires call_id')
+        }
+        messages.push({
+          role: 'tool',
+          content: item.output ?? '',
+          tool_call_id: item.call_id
+        })
+      } else if (itemType === 'function_call_output') {
         if (!item.call_id) {
           throw new Error('function_call_output requires call_id')
         }
@@ -183,7 +225,10 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
           throw new Error('message input item requires content')
         }
         messages.push({
-          role: item.role === 'assistant' ? 'assistant' : item.role === 'system' ? 'system' : 'user',
+          // codex Responses Lite 会以 developer 角色下发基础指令，归并到 system。
+          role: item.role === 'assistant' ? 'assistant'
+            : (item.role === 'system' || item.role === 'developer') ? 'system'
+            : 'user',
           content: convertResponseInputContent(item.content)
         })
       }
@@ -198,9 +243,19 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
   if (request.top_p !== undefined) chatRequest.top_p = request.top_p
   if (request.max_output_tokens !== undefined) chatRequest.max_tokens = request.max_output_tokens
   if (request.stream !== undefined) chatRequest.stream = request.stream
-  if (request.tools !== undefined) chatRequest.tools = request.tools
+  const convertedTools = collectedResponsesTools
+    .map(convertResponsesTool)
+    .filter((t): t is OpenAITool => t !== undefined)
+  if (convertedTools.length > 0) chatRequest.tools = convertedTools
   const toolChoice = convertResponseToolChoice(request.tool_choice)
   if (toolChoice !== undefined) chatRequest.tool_choice = toolChoice
+  // codex 的 reasoning.effort（Responses API）映射为 chat 的 reasoning_effort，
+  // 由下游按模型能力决定是否注入 additionalModelRequestFields：
+  // 仅当该模型在 Kiro 元数据里明确声明 thinking/reasoning schema 时才注入；
+  // 像 gpt-5.6-sol 这类模型 Kiro 不接受 additionalModelRequestFields（其推理在服务端按模型档位处理），
+  // 声明为 null → 不注入 → 不会再触发 "additionalModelRequestFields is not supported for this model"。
+  const reasoningEffort = (request.reasoning as { effort?: string } | undefined)?.effort
+  if (typeof reasoningEffort === 'string') chatRequest.reasoning_effort = reasoningEffort
   if (request.previous_response_id !== undefined) chatRequest.conversation_id = request.previous_response_id
   if (request.metadata !== undefined) chatRequest.metadata = request.metadata
   if (request.kiro_context !== undefined) chatRequest.kiro_context = request.kiro_context
@@ -241,6 +296,62 @@ function convertResponseInputContent(content: string | OpenAIResponseContentPart
     }
     return { type: 'text', text: part.text }
   })
+}
+
+// Responses API 工具（扁平：{type,name,description,parameters}）转 Chat Completions 嵌套 OpenAITool。
+// - function：直接映射到 { type:'function', function:{...} }
+// - custom（codex exec/apply_patch 等语法约束工具）：Kiro/Bedrock 无法表达 grammar，
+//   降级为接受单个自由文本 input 的 function，至少让模型看得到并能调用该工具。
+// - 已是嵌套格式的直接透传；其余内置工具（web_search 等 Kiro 无法执行）丢弃。
+function convertResponsesTool(tool: OpenAIResponsesTool | undefined): OpenAITool | undefined {
+  if (!tool || typeof tool !== 'object') return undefined
+
+  // 已是 Chat 嵌套格式
+  if (tool.function && tool.function.name) {
+    return {
+      type: 'function',
+      function: {
+        name: tool.function.name,
+        description: tool.function.description || '',
+        parameters: tool.function.parameters ?? { type: 'object', properties: {} }
+      },
+      ...(tool.cache_control ? { cache_control: tool.cache_control } : {})
+    }
+  }
+
+  const type = tool.type
+  if ((type === 'function' || type === undefined) && tool.name) {
+    return {
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description || '',
+        parameters: tool.parameters ?? { type: 'object', properties: {} }
+      },
+      ...(tool.cache_control ? { cache_control: tool.cache_control } : {})
+    }
+  }
+
+  if (type === 'custom' && tool.name) {
+    return {
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description || '',
+        parameters: {
+          type: 'object',
+          properties: {
+            input: { type: 'string', description: 'Raw tool input.' }
+          },
+          required: ['input']
+        }
+      },
+      ...(tool.cache_control ? { cache_control: tool.cache_control } : {})
+    }
+  }
+
+  // 其余类型（web_search / file_search / image_generation 等内置工具）Kiro 无法执行，丢弃。
+  return undefined
 }
 
 function convertResponseToolChoice(toolChoice: OpenAIResponsesRequest['tool_choice']): OpenAIChatRequest['tool_choice'] {

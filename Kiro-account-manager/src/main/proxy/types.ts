@@ -121,13 +121,31 @@ export interface OpenAIResponsesRequest {
 }
 
 export interface OpenAIResponseInputItem {
-  type?: 'message' | 'function_call' | 'function_call_output'
-  role?: 'system' | 'user' | 'assistant' | 'tool'
+  type?: 'message' | 'function_call' | 'function_call_output' | 'additional_tools' | string
+  role?: 'system' | 'user' | 'assistant' | 'tool' | 'developer' | string
   content?: string | OpenAIResponseContentPart[]
   call_id?: string
   name?: string
   arguments?: string
   output?: string
+  // custom_tool_call 的自由文本入参（对应 custom 工具，如 codex exec）
+  input?: string
+  // Responses Lite（gpt-5.6-sol 等）会把工具 schema 塞进 input 里的 additional_tools 条目，
+  // 并省略顶层 tools。这里的 tools 为 Responses API 扁平格式（可能含 custom 类型）。
+  tools?: OpenAIResponsesTool[]
+}
+
+// Responses API 工具（扁平格式），与 Chat Completions 的嵌套 OpenAITool 不同。
+export interface OpenAIResponsesTool {
+  type?: 'function' | 'custom' | string
+  name?: string
+  description?: string
+  parameters?: unknown
+  // custom 工具（如 codex exec）用 format 描述语法约束（如 lark grammar），Kiro 无法表达。
+  format?: unknown
+  // 兼容个别客户端直接发嵌套格式的情况。
+  function?: { name: string; description?: string; parameters?: unknown }
+  cache_control?: ClaudeCacheControl
 }
 
 export interface OpenAIResponseContentPart {
