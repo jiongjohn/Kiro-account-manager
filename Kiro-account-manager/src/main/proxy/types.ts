@@ -130,6 +130,8 @@ export interface OpenAIResponseInputItem {
   output?: string
   // custom_tool_call 的自由文本入参（对应 custom 工具，如 codex exec）
   input?: string
+  // agent_message（codex 回传的上一轮助手文本回复）用 text 承载，而非 content
+  text?: string
   // Responses Lite（gpt-5.6-sol 等）会把工具 schema 塞进 input 里的 additional_tools 条目，
   // 并省略顶层 tools。这里的 tools 为 Responses API 扁平格式（可能含 custom 类型）。
   tools?: OpenAIResponsesTool[]

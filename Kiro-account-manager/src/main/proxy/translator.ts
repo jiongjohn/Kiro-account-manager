@@ -217,10 +217,13 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
             }
           }]
         })
-      } else {
-        if (itemType !== undefined && itemType !== 'message') {
-          throw new Error(`Unsupported responses input item type: ${itemType}`)
-        }
+      } else if (itemType === 'agent_message') {
+        // codex 回传的上一轮助手文本回复（字段是 text，不是 content；可能带 phase）。
+        const text = typeof item.text === 'string'
+          ? item.text
+          : (typeof item.content === 'string' ? item.content : '')
+        messages.push({ role: 'assistant', content: text })
+      } else if (itemType === undefined || itemType === 'message') {
         if (item.content === undefined) {
           throw new Error('message input item requires content')
         }
@@ -231,6 +234,22 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
             : 'user',
           content: convertResponseInputContent(item.content)
         })
+      } else {
+        // 未知条目类型：codex/Responses 协议持续演进，可能出现新的 item type。
+        // 跳过而非硬失败，避免单个未识别条目就把整条请求 400 掉（历史上 additional_tools /
+        // agent_message 都是这样冒出来的）。如带文本内容则尽量保留为一条消息。
+        console.warn(`[responsesToOpenAIChat] skipping unsupported input item type: ${itemType}`)
+        const salvage = typeof item.text === 'string'
+          ? item.text
+          : (typeof item.content === 'string' ? item.content : undefined)
+        if (salvage) {
+          messages.push({
+            role: item.role === 'assistant' ? 'assistant'
+              : (item.role === 'system' || item.role === 'developer') ? 'system'
+              : 'user',
+            content: salvage
+          })
+        }
       }
     }
   }
