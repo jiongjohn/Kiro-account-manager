@@ -324,9 +324,11 @@ export function mapModelId(model: string): string {
   // 2) 看似 Kiro 支持的 Claude 模型格式 (claude-{sonnet|haiku|opus}-{ver})，原样透传
   //    用于向前兼容尚未加入 MODEL_ID_MAP 的新发布模型
   if (/^claude-(sonnet|haiku|opus)-/.test(lower)) return modelId
-  // 3) 完全未知的 model（用户拼错/不存在），兜底到 default 避免直接 400
-  console.warn(`[Kiro API] Unknown model "${modelId}" → fallback to "${MODEL_ID_MAP.default}"`)
-  return MODEL_ID_MAP.default
+  // 3) 其它未在别名表里的模型（gpt-5.6-sol / deepseek / glm / qwen / minimax 等 Kiro 新模型）：
+  //    原样透传，交给 resolveCodeWhispererModelId 去 Kiro 已下发的模型列表里匹配真实 CodeWhisperer id。
+  //    以前这里硬回退到 claude-sonnet-4.5，会把 gpt-5.6-sol 等名字在解析前就冲掉 → 实际当 Sonnet 跑。
+  //    resolveCodeWhispererModelId 对真正匹配不到的名字仍有 CODEWHISPERER_DEFAULT_MODEL_ID 兜底，不会 400。
+  return modelId
 }
 
 function clonePayload(payload: KiroPayload): KiroPayload {

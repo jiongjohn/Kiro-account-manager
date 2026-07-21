@@ -383,19 +383,59 @@ function convertResponseToolChoice(toolChoice: OpenAIResponsesRequest['tool_choi
   throw new Error('Unsupported responses tool_choice')
 }
 
+// 从 Responses 请求里收集"以 custom 登记的工具"名字（顶层 tools + input 里的 additional_tools）。
+// 回程时这些工具的调用必须发 custom_tool_call 而非 function_call（见 openAIChatToResponsesResponse）。
+export function extractCustomToolNames(request: OpenAIResponsesRequest): Set<string> {
+  const names = new Set<string>()
+  const scan = (tools: unknown): void => {
+    if (!Array.isArray(tools)) return
+    for (const t of tools) {
+      if (t && typeof t === 'object' && (t as OpenAIResponsesTool).type === 'custom' && (t as OpenAIResponsesTool).name) {
+        names.add((t as OpenAIResponsesTool).name as string)
+      }
+    }
+  }
+  scan(request.tools as unknown)
+  if (Array.isArray(request.input)) {
+    for (const item of request.input) {
+      if (item && (item as { type?: string }).type === 'additional_tools') scan((item as { tools?: unknown }).tools)
+    }
+  }
+  return names
+}
+
 export function openAIChatToResponsesResponse(
   response: OpenAIChatResponse,
-  previousResponseId?: string
+  previousResponseId?: string,
+  customToolNames?: Set<string>
 ): OpenAIResponsesResponse {
   const output: OpenAIResponseOutputItem[] = response.choices.flatMap<OpenAIResponseOutputItem>(choice => {
     if (choice.message.tool_calls?.length) {
-      return choice.message.tool_calls.map(toolCall => ({
-        type: 'function_call' as const,
-        id: `fc_${uuidv4()}`,
-        call_id: toolCall.id,
-        name: toolCall.function.name,
-        arguments: toolCall.function.arguments
-      }))
+      return choice.message.tool_calls.map(toolCall => {
+        // custom 工具（codex exec/apply_patch 等）：回程为 custom_tool_call，并把入站降级时包的
+        // { input: "..." } 解包回裸文本；解析不出就退化用整个 arguments 字符串当 input。
+        if (customToolNames?.has(toolCall.function.name)) {
+          let input = toolCall.function.arguments
+          try {
+            const parsed = JSON.parse(toolCall.function.arguments)
+            if (parsed && typeof parsed === 'object' && typeof parsed.input === 'string') input = parsed.input
+          } catch { /* 保留原始 arguments 作为 input */ }
+          return {
+            type: 'custom_tool_call' as const,
+            id: `ctc_${uuidv4()}`,
+            call_id: toolCall.id,
+            name: toolCall.function.name,
+            input
+          }
+        }
+        return {
+          type: 'function_call' as const,
+          id: `fc_${uuidv4()}`,
+          call_id: toolCall.id,
+          name: toolCall.function.name,
+          arguments: toolCall.function.arguments
+        }
+      })
     }
     return [{
       type: 'message' as const,
@@ -638,6 +678,16 @@ export function openaiToKiro(
   // 如果没有当前内容但有工具结果（最后一轮的），保留它们传给 currentMessage
   if (!currentContent && toolResults.length > 0) {
     currentContent = 'Tool results provided.'
+  }
+
+  // codex / OpenAI 客户端不发 cache_control（OpenAI 走服务端隐式缓存），于是 Responses/Chat
+  // 路径转成 Kiro payload 后一个 cachePoint 都没有，Bedrock 既不写也不读 → prompt cache 恒空
+  // （gpt-5.6-sol 实测复现：/v1/responses 无任何 cache 字段；同模型走 /v1/messages 带 cache_control
+  // 则冷写 3124 / 重发命中 3124）。这里在客户端未自带 cachePoint 时，于 system prompt 末尾自动补一个
+  // 稳定 cachePoint：system 跨轮字节不变、且是唯一（末条）cachePoint，契合 Kiro「只认末条 cachePoint、
+  // 要求其前缀跨轮字节一致」的匹配方式 → 增长型对话每轮都能命中 system 段。KIRO_AUTO_CACHE_OPENAI=0 可关。
+  if (systemPrompt && !systemCachePoint && process.env.KIRO_AUTO_CACHE_OPENAI !== '0') {
+    systemCachePoint = KIRO_CACHE_POINT
   }
 
   // System prompt 以 Kiro 官方方式注入：作为 Human/AI pair 插入到 history 头部

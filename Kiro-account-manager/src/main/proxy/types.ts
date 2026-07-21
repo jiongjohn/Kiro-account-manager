@@ -177,6 +177,9 @@ export interface OpenAIResponsesResponse {
 export type OpenAIResponseOutputItem =
   | { type: 'message'; id: string; role: 'assistant'; content: { type: 'output_text'; text: string }[] }
   | { type: 'function_call'; id: string; call_id: string; name: string; arguments: string }
+  // codex 的 exec/apply_patch 等以 custom 工具登记，其调用必须回程为 custom_tool_call（input 为裸文本），
+  // 否则 codex 的 tool router 会因收到 function_call 而判 incompatible payload 直接 fatal 中止。
+  | { type: 'custom_tool_call'; id: string; call_id: string; name: string; input: string }
 
 // ============ Claude 兼容格式 ============
 export interface ClaudeRequest {

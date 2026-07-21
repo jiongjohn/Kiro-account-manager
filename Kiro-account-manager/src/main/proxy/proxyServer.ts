@@ -33,7 +33,8 @@ import {
   createOpenaiStreamChunk,
   createClaudeStreamEvent,
   responsesToOpenAIChat,
-  openAIChatToResponsesResponse
+  openAIChatToResponsesResponse,
+  extractCustomToolNames
 } from './translator'
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
@@ -821,6 +822,47 @@ export class ProxyServer {
     }
 
     return request
+  }
+
+  // 为 OpenAI / responses 路径构建 prompt cache 模拟 profile。
+  // codex / OpenAI 客户端不发 cache_control（服务端隐式缓存），这里自动把 system 作为缓存断点
+  // （合成 ephemeral），复用 Claude 路径同款 promptCacheTracker，让 codex/gpt5.6 也能显示 cache 命中。
+  private buildOpenAICacheProfile(
+    request: OpenAIChatRequest,
+    totalInputTokens: number
+  ): ReturnType<typeof promptCacheTracker.buildClaudeProfile> {
+    let systemText = ''
+    const nonSystem: { role: string; content: unknown }[] = []
+    for (const m of request.messages || []) {
+      const c = typeof m.content === 'string' ? m.content : (m.content == null ? '' : JSON.stringify(m.content))
+      if (m.role === 'system') systemText += (systemText ? '\n' : '') + c
+      else nonSystem.push({ role: m.role, content: c })
+    }
+    if (!systemText) return null  // 无 system → 无稳定断点，跳过模拟
+    const system = [{ type: 'text', text: systemText, cache_control: { type: 'ephemeral' } }]
+    const tools = request.tools?.map(t => ({
+      name: t.function.name,
+      description: t.function.description || '',
+      input_schema: t.function.parameters
+    }))
+    return promptCacheTracker.buildClaudeProfile(system, nonSystem, tools, totalInputTokens, request.model)
+  }
+
+  // 缓冲（非流式 / responses 假流式）路径：请求结束后就地计算命中并写回 usage.cacheReadTokens，
+  // 下游 kiroToOpenaiResponse / openAIChatToResponsesResponse 会把它映射成 cached_tokens。
+  private applyOpenAICacheSim(
+    request: OpenAIChatRequest,
+    accountId: string,
+    usage: { inputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
+  ): void {
+    try {
+      const profile = this.buildOpenAICacheProfile(request, Math.max(1, usage.inputTokens))
+      if (!profile) return
+      const cu = promptCacheTracker.compute(accountId, profile)
+      if (cu.cacheReadInputTokens > 0) usage.cacheReadTokens = cu.cacheReadInputTokens
+      if (cu.cacheCreationInputTokens > 0) usage.cacheWriteTokens = cu.cacheCreationInputTokens
+      promptCacheTracker.update(accountId, profile)
+    } catch { /* 模拟失败不影响主流程 */ }
   }
 
   private prepareClaudeRequest(request: ClaudeRequest): ClaudeRequest {
@@ -2677,7 +2719,11 @@ export class ProxyServer {
 
       if (request.stream) {
         // 流式响应（流式不使用重试机制，错误由流处理）
-        await this.handleOpenAIStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, matchedApiKey, toolNameRegistry, signal)
+        // OpenAI 路径 prompt cache 模拟：请求前算命中，随流末 usage 一起下发
+        const oaiCacheProfile = this.buildOpenAICacheProfile(processedRequest, Math.max(1, Math.round(JSON.stringify(kiroPayload).length * 0.3)))
+        const oaiCacheUsage = oaiCacheProfile ? promptCacheTracker.compute(account.id, oaiCacheProfile) : null
+        await this.handleOpenAIStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, matchedApiKey, toolNameRegistry, signal,
+          oaiCacheProfile ? { ...oaiCacheUsage!, cacheProfile: oaiCacheProfile, accountId: account.id } : undefined)
       } else {
         // 非流式响应（带重试机制）
         const { result, account: usedAccount } = await this.callWithRetry(
@@ -2689,6 +2735,7 @@ export class ProxyServer {
           '/v1/chat/completions',
           signal
         )
+        this.applyOpenAICacheSim(processedRequest, usedAccount.id, result.usage)
         const response = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
         this.throwIfResponseClosed(res, signal)
@@ -2726,9 +2773,12 @@ export class ProxyServer {
     let chatRequest: OpenAIChatRequest
     let processedRequest: OpenAIChatRequest
     let affinityHintResp: string | undefined
+    let customToolNames: Set<string> = new Set()
     try {
       responseRequest = JSON.parse(body)
       chatRequest = responsesToOpenAIChat(responseRequest)
+      // codex 的 exec/apply_patch 等 custom 工具：回程需发 custom_tool_call 而非 function_call
+      customToolNames = extractCustomToolNames(responseRequest)
       // session hint：用于会话粘性
       const rawHintResp = ProxyServer.extractSessionHint(req, responseRequest)
       if (rawHintResp) {
@@ -2792,9 +2842,10 @@ export class ProxyServer {
           '/v1/responses',
           signal
         )
+        this.applyOpenAICacheSim(processedRequest, usedAccount.id, result.usage)
         const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
         this.throwIfResponseClosed(res, signal)
-        const response = openAIChatToResponsesResponse(chatResponse, responseRequest.previous_response_id)
+        const response = openAIChatToResponsesResponse(chatResponse, responseRequest.previous_response_id, customToolNames)
         const streamedResponse = { ...response, id: responseId }
         streamedResponse.output.forEach((item, outputIndex) => {
           this.throwIfResponseClosed(res, signal)
@@ -2809,6 +2860,12 @@ export class ProxyServer {
               res.write(`event: response.output_text.done\ndata: ${JSON.stringify({ type: 'response.output_text.done', item_id: item.id, output_index: outputIndex, content_index: contentIndex, text: part.text })}\n\n`)
               res.write(`event: response.content_part.done\ndata: ${JSON.stringify({ type: 'response.content_part.done', item_id: item.id, output_index: outputIndex, content_index: contentIndex, part })}\n\n`)
             })
+          } else if (item.type === 'custom_tool_call') {
+            // codex custom 工具（exec/apply_patch）：发 custom_tool_call_input 事件，input 为裸文本
+            if (item.input) {
+              res.write(`event: response.custom_tool_call_input.delta\ndata: ${JSON.stringify({ type: 'response.custom_tool_call_input.delta', item_id: item.id, output_index: outputIndex, delta: item.input })}\n\n`)
+            }
+            res.write(`event: response.custom_tool_call_input.done\ndata: ${JSON.stringify({ type: 'response.custom_tool_call_input.done', item_id: item.id, output_index: outputIndex, input: item.input })}\n\n`)
           } else {
             if (item.arguments) {
               res.write(`event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: 'response.function_call_arguments.delta', item_id: item.id, output_index: outputIndex, delta: item.arguments })}\n\n`)
@@ -2844,6 +2901,7 @@ export class ProxyServer {
         '/v1/responses',
         signal
       )
+      this.applyOpenAICacheSim(processedRequest, usedAccount.id, result.usage)
       const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
       this.throwIfResponseClosed(res, signal)
       const response = openAIChatToResponsesResponse(chatResponse, responseRequest.previous_response_id)
@@ -2879,7 +2937,8 @@ export class ProxyServer {
     headersSent: boolean = false,
     matchedApiKey?: import('./types').ApiKey,
     toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    simulatedCacheUsage?: { cacheCreationInputTokens: number; cacheReadInputTokens: number; cacheProfile?: unknown; accountId?: string }
   ): Promise<void> {
     if (!headersSent) {
       res.writeHead(200, {
@@ -2946,6 +3005,15 @@ export class ProxyServer {
             return
           }
           
+          // OpenAI 路径 prompt cache 模拟：用模拟命中覆盖 usage.cacheReadTokens（下面会下发为 cached_tokens）
+          if (simulatedCacheUsage) {
+            if (simulatedCacheUsage.cacheReadInputTokens > 0) usage.cacheReadTokens = simulatedCacheUsage.cacheReadInputTokens
+            if (simulatedCacheUsage.cacheCreationInputTokens > 0) usage.cacheWriteTokens = simulatedCacheUsage.cacheCreationInputTokens
+            if (simulatedCacheUsage.cacheProfile && simulatedCacheUsage.accountId) {
+              promptCacheTracker.update(simulatedCacheUsage.accountId, simulatedCacheUsage.cacheProfile as Parameters<typeof promptCacheTracker.update>[1])
+            }
+          }
+
           this.recordRequestSuccess()
           this.stats.totalTokens += usage.inputTokens + usage.outputTokens
           this.stats.inputTokens += usage.inputTokens
