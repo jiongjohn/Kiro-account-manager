@@ -97,6 +97,34 @@ function findClosers(s: string, from: number): Array<{ idx: number; tag: string 
   return out.sort((x, y) => x.idx - y.idx)
 }
 
+// ===== Markdown 围栏跟踪 =====
+// 围栏内的工具调用标签是模型「刻意当字面量展示」的，不是泄漏，必须原样放行：
+// 实测让模型给本文件的单测加用例时，它写的 <tool_use ...>…</tool_use> 字面量会被当成泄漏吃掉
+// （代码变成 const leak = ''，语法还正确所以不易察觉），同时凭空注入一次真实工具调用。
+// 代价：万一后端把真泄漏包在未闭合的围栏之后发出来，就救不回了 —— 真泄漏是模型的裸工具语法，
+// 不是给人看的带围栏散文，这个交换划算。
+// 只处理 ``` / ~~~ 围栏；单反引号行内代码不覆盖（完整工具块写在行内极少见，且散文里未配对的
+// 反引号很常见，跟踪它误判风险更大）。
+const FENCE_LINE = /^[ \t]{0,3}(?:`{3,}|~{3,})/
+
+interface FenceState {
+  open: boolean
+  line: string // 当前尚未收到换行的残行（跨帧累积）
+}
+
+// 从给定状态出发扫过 chunk，返回新状态。围栏只在整行收完时翻转（围栏标记独占一行）
+function scanFences(chunk: string, state: FenceState): FenceState {
+  if (!chunk) return state
+  const parts = chunk.split('\n')
+  let open = state.open
+  let line = state.line + parts[0]
+  for (let i = 1; i < parts.length; i++) {
+    if (FENCE_LINE.test(line)) open = !open
+    line = parts[i]
+  }
+  return { open, line }
+}
+
 // 泄漏文本前可能有被后端损坏的 <function_calls> 残迹（含纯文本 "count"）
 function stripToolPrefix(pre: string): string {
   const fc = pre.match(/<function_calls>\s*$/)
@@ -143,6 +171,16 @@ export function createToolLeakFilter(options: ToolLeakFilterOptions): ToolLeakFi
   // 刚消费掉一个工具块，后面可能还跟一个孤立的 </function_calls> 收尾。
   // 它常常在下一帧才到（此时 carry 已清空、没有开标签与之配对），若不认领就会漏成可见文本。
   let pendingFcClose = false
+  // carry 起始位置处的围栏状态
+  let fence: FenceState = { open: false, line: '' }
+
+  // 推进 carry 并同步维护围栏状态。所有 carry 前进都必须走这里，
+  // 否则围栏状态会与位置错位，围栏判定随即失效
+  const advance = (n: number): void => {
+    if (n <= 0) return
+    fence = scanFences(carry.slice(0, n), fence)
+    carry = carry.slice(n)
+  }
 
   const emit = async (s: string): Promise<void> => {
     if (!s) return
@@ -158,16 +196,26 @@ export function createToolLeakFilter(options: ToolLeakFilterOptions): ToolLeakFi
     }
   }
 
-  // 消费 carry 开头的一个工具块。返回 false = 需要等更多帧（carry 保持不动）
-  const extractOne = async (isFlush: boolean, justConsumedBlock: boolean): Promise<boolean> => {
+  // 消费 carry 开头的一个工具块。
+  // 'none' = 需要等更多帧（carry 不动）；'block' = 消费掉一个工具块；'text' = 当普通文本放行了一段
+  const extractOne = async (isFlush: boolean, justConsumedBlock: boolean): Promise<'none' | 'block' | 'text'> => {
     const openAt = findOpener(carry)
-    if (openAt === -1) return false
+    if (openAt === -1) return 'none'
+
+    // 围栏内的标签是模型刻意展示的字面量，原样放行：吐掉「前缀 + 开标签的 '<'」，
+    // 剩下的部分按普通文本继续流走（'<' 已消费，下一轮不会再把它当开标签）
+    if (scanFences(carry.slice(0, openAt), fence).open) {
+      await emit(carry.slice(0, openAt + 1))
+      advance(openAt + 1)
+      return 'text'
+    }
+
     const gt = carry.indexOf('>', openAt)
-    if (gt === -1) return false // 开标签本身还没收完，等下一帧
+    if (gt === -1) return 'none' // 开标签本身还没收完，等下一帧
     const openTag = carry.slice(openAt, gt + 1)
     const nameM = openTag.match(/\bname="([^"]+)"/)
     const candidates = findClosers(carry, gt + 1)
-    if (!candidates.length) return false // 收尾标签还没到，等下一帧
+    if (!candidates.length) return 'none' // 收尾标签还没到，等下一帧
 
     // 选定收尾标签：默认最早的那个。若参数体看着是 JSON 但在此处解析不出来
     // （参数值里可能含 "</invoke>" 之类字面量，或 JSON 本身跨帧还没收完），顺延到下一个候选重试
@@ -187,7 +235,7 @@ export function createToolLeakFilter(options: ToolLeakFilterOptions): ToolLeakFi
       // 没有候选能解出完整 JSON：只有体看着还没收完（未见收尾 '}'）才等后续帧。
       // 已经是完整括号却解析不了 = 真畸形（或被 Kiro 截断），立刻按最早的收尾标签消费掉，
       // 至少把工具名救回来，避免后续文本被一直缓冲、流式输出卡到流末尾
-      if (!matched && !isFlush && !carry.slice(gt + 1, candidates[0].idx).trim().endsWith('}')) return false
+      if (!matched && !isFlush && !carry.slice(gt + 1, candidates[0].idx).trim().endsWith('}')) return 'none'
     }
 
     const prefix = carry.slice(0, openAt)
@@ -214,8 +262,8 @@ export function createToolLeakFilter(options: ToolLeakFilterOptions): ToolLeakFi
       // 拿不到工具名（畸形开标签）：救不回来也不能吞字符，原样当文本输出
       await emit(carry.slice(openAt, consumedEnd))
     }
-    carry = carry.slice(consumedEnd)
-    return true
+    advance(consumedEnd)
+    return 'block'
   }
 
   const process = async (isFlush: boolean): Promise<void> => {
@@ -224,7 +272,7 @@ export function createToolLeakFilter(options: ToolLeakFilterOptions): ToolLeakFi
     if (pendingFcClose) {
       const head = carry.replace(/^\s*/, '')
       if (head.startsWith(CLOSE_FC)) {
-        carry = carry.slice(carry.length - head.length + CLOSE_FC.length)
+        advance(carry.length - head.length + CLOSE_FC.length)
         pendingFcClose = false
       } else if (head && !CLOSE_FC.startsWith(head)) {
         pendingFcClose = false
@@ -232,7 +280,11 @@ export function createToolLeakFilter(options: ToolLeakFilterOptions): ToolLeakFi
     }
 
     let justConsumedBlock = false
-    while (await extractOne(isFlush, justConsumedBlock)) justConsumedBlock = true
+    for (;;) {
+      const step = await extractOne(isFlush, justConsumedBlock)
+      if (step === 'none') break
+      justConsumedBlock = step === 'block'
+    }
 
     // 仍有未闭合的开标签：保留从开标签起，等下一帧
     const openAt = findOpener(carry)
@@ -240,22 +292,22 @@ export function createToolLeakFilter(options: ToolLeakFilterOptions): ToolLeakFi
       if (isFlush) {
         // 流结束仍未闭合 = 损坏的工具调用，原样当文本输出（不丢字符）
         await emit(carry)
-        carry = ''
+        advance(carry.length)
         return
       }
       const safe = stripToolPrefix(carry.slice(0, openAt))
       await emit(safe)
-      carry = carry.slice(safe.length)
+      advance(safe.length)
       return
     }
     if (isFlush) {
       await emit(carry)
-      carry = ''
+      advance(carry.length)
       return
     }
     const hold = pendingToolTail(carry)
     await emit(carry.slice(0, carry.length - hold))
-    carry = carry.slice(carry.length - hold)
+    advance(carry.length - hold)
   }
 
   return {

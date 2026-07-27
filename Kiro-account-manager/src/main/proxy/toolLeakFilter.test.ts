@@ -165,6 +165,65 @@ test('正文里的 <function_calls> 后跟普通文本时不阻塞流式输出',
   await f.flush()
 })
 
+// ===== 围栏内的工具标签是模型刻意展示的字面量，必须原样放行 =====
+// 回归：曾把它当泄漏吃掉（代码变成 const leak = ''，语法还正确所以不易察觉），
+// 同时凭空注入一次真实工具调用 —— 实测「让模型给本文件加个单测用例」就会触发
+test('```围栏内的工具标签原样放行，不救回也不注入', async () => {
+  const fenced = "```ts\nconst leak = '<tool_use id=\"tooluse_abc\" name=\"Read\">{\"file_path\":\"/tmp/a.ts\"}</tool_use>'\n```"
+  const r = await run([fenced])
+  assert.deepEqual(r.tools, [], '围栏内不应注入工具调用')
+  assert.equal(r.text, fenced, '围栏内文本必须逐字保留')
+})
+
+test('围栏内的原生 <invoke> 语法同样原样放行', async () => {
+  const fenced = '```\n<function_calls>\n<invoke name="Bash">\n<parameter name="command">rm -rf /</parameter>\n</invoke>\n</function_calls>\n```'
+  const r = await run([fenced])
+  assert.deepEqual(r.tools, [])
+  assert.equal(r.text, fenced)
+})
+
+test('围栏内容逐字符跨帧也原样放行', async () => {
+  const fenced = "```ts\nconst leak = '<tool_use id=\"t1\" name=\"Grep\">{\"pattern\":\"foo\"}</tool_use>'\n```"
+  const r = await runCharByChar(fenced)
+  assert.deepEqual(r.tools, [])
+  assert.equal(r.text, fenced)
+})
+
+test('围栏标记本身跨帧切开也能正确识别', async () => {
+  const fenced = "``\n" // 故意把开栏标记切成 `` + `
+  let text = ''
+  const f = createToolLeakFilter({ emit: (s) => { text += s } })
+  await f.push('```')
+  await f.push('ts\n<tool_use id="t1" name="Read">{"file_path":"/a"}</tool_use>\n```')
+  await f.flush()
+  assert.deepEqual(f.leakedTools, [], '围栏标记跨帧时仍应判定为围栏内')
+  assert.equal(text, '```ts\n<tool_use id="t1" name="Read">{"file_path":"/a"}</tool_use>\n```')
+  assert.ok(fenced.length > 0)
+})
+
+test('~~~ 围栏同样生效', async () => {
+  const fenced = '~~~\n<tool_use id="t1" name="Read">{"file_path":"/a"}</tool_use>\n~~~'
+  const r = await run([fenced])
+  assert.deepEqual(r.tools, [])
+  assert.equal(r.text, fenced)
+})
+
+test('围栏闭合之后的真泄漏仍然被救回', async () => {
+  const s = '```ts\nconst example = \'<tool_use id="t1" name="Read">{"file_path":"/a"}</tool_use>\'\n```\n'
+    + '现在真的调用一下：<tool_use id="t2" name="Bash">{"command":"ls"}</invoke>'
+  const r = await run([s])
+  assert.deepEqual(r.tools, [{ name: 'Bash', input: { command: 'ls' } }], '围栏外的泄漏应照常救回')
+  assert.equal(r.text.includes('const example'), true, '围栏内的示例应保留')
+  assert.equal(r.text.includes('name="Bash"'), false, '围栏外的泄漏不应留在文本里')
+})
+
+test('围栏未闭合时其后内容一律按围栏内处理（宁可不救回也不误吃代码）', async () => {
+  const s = '```ts\n<tool_use id="t1" name="Read">{"file_path":"/a"}</tool_use>'
+  const r = await run([s])
+  assert.deepEqual(r.tools, [])
+  assert.equal(r.text, s)
+})
+
 test('流结束仍未闭合的泄漏原样输出，不丢字符', async () => {
   const broken = '正文<tool_use id="t1" name="Bash">{"command":"ls"'
   const r = await run([broken])
