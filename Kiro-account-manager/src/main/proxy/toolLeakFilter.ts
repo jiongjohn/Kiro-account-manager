@@ -61,6 +61,61 @@ function parseParameterBody(name: string, body: string): LeakedTool {
   return { name, input }
 }
 
+// <parameter> 体是否完整：最后一个 </parameter> 之后不能再出现 <parameter
+// （说明最后一个参数被截断）。截断了绝不能救回 —— Edit 少一个 new_string 会写坏文件。
+function paramBodyComplete(body: string): boolean {
+  if (!/<parameter name="/.test(body)) return false
+  const last = body.lastIndexOf('</parameter>')
+  if (last === -1) return false
+  return !body.slice(last + '</parameter>'.length).includes('<parameter')
+}
+
+// 解析工具名 + 参数。
+// 工具名优先取开标签的 name="..."。实测还有一种形态：开标签只有 id，工具名当成一个参数传 ——
+//   <tool_use id="toolu_bdrk_..."><parameter name="name">Edit</parameter>…</invoke>
+// 只看开标签就拿不到名字，会落到「原样当文本输出」分支 → 工具丢失、任务中断。
+// strict=true（流结束兜底救回）时要求体必须完整可解析，绝不用空参数凑。
+function resolveLeakedTool(
+  openTag: string,
+  body: string,
+  jsonInput: Record<string, unknown> | null,
+  strict: boolean
+): LeakedTool | null {
+  const attr = openTag.match(/\bname="([^"]+)"/)
+  const isParamBody = /<parameter name="/.test(body)
+  if (attr) {
+    if (isParamBody) return paramBodyComplete(body) ? parseParameterBody(attr[1], body) : null
+    const parsed = jsonInput ?? parseJsonBody(body)
+    if (!parsed && strict) return null
+    return { name: attr[1], input: parsed ?? {} }
+  }
+  // 开标签没有 name：名字只可能在体里
+  if (isParamBody) {
+    // <parameter name="name">Edit</parameter> —— 取到后它是工具名，不再算工具参数
+    if (!paramBodyComplete(body)) return null
+    const parsed = parseParameterBody('', body)
+    const inner = parsed.input.name
+    if (typeof inner !== 'string' || !inner.trim()) return null
+    delete parsed.input.name
+    return { name: inner.trim(), input: parsed.input }
+  }
+  // JSON 体里的 name 字段。四个变化轴（开标签 / 名字位置 / 体格式 / 收尾标签）的组合里
+  // 这一格尚未在线上见到，按对称性一并覆盖：开标签既然没有 name，名字就只能在 JSON 里，
+  // 因此把 name 解释成工具名是唯一可能的读法（开标签带 name 时不走这里，
+  // 体内的 name 仍照常当普通参数）
+  const json = jsonInput ?? parseJsonBody(body)
+  if (!json || typeof json.name !== 'string' || !json.name.trim()) return null
+  const nested = json.input ?? json.arguments ?? json.parameters
+  let input: Record<string, unknown>
+  if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+    input = nested as Record<string, unknown>
+  } else {
+    input = { ...json }
+    delete input.name
+  }
+  return { name: json.name.trim(), input }
+}
+
 function parseJsonBody(body: string): Record<string, unknown> | null {
   const raw = body.trim()
   if (!raw) return null
@@ -213,7 +268,6 @@ export function createToolLeakFilter(options: ToolLeakFilterOptions): ToolLeakFi
     const gt = carry.indexOf('>', openAt)
     if (gt === -1) return 'none' // 开标签本身还没收完，等下一帧
     const openTag = carry.slice(openAt, gt + 1)
-    const nameM = openTag.match(/\bname="([^"]+)"/)
     const candidates = findClosers(carry, gt + 1)
     if (!candidates.length) return 'none' // 收尾标签还没到，等下一帧
 
@@ -236,6 +290,19 @@ export function createToolLeakFilter(options: ToolLeakFilterOptions): ToolLeakFi
       // 已经是完整括号却解析不了 = 真畸形（或被 Kiro 截断），立刻按最早的收尾标签消费掉，
       // 至少把工具名救回来，避免后续文本被一直缓冲、流式输出卡到流末尾
       if (!matched && !isFlush && !carry.slice(gt + 1, candidates[0].idx).trim().endsWith('}')) return 'none'
+    } else if (carry.slice(gt + 1).trimStart().startsWith('<parameter name="')) {
+      // <parameter> 体同理：参数值里可能含 </invoke> 之类字面量（例如 Edit 的 old_string 正好
+      // 在改这类标签），取最早的收尾标签会把最后一个参数截断，而截断的参数是静默丢失的 ——
+      // 顺延到能拿到完整参数体的候选
+      let matched = false
+      for (const c of candidates) {
+        if (paramBodyComplete(carry.slice(gt + 1, c.idx))) {
+          chosen = c
+          matched = true
+          break
+        }
+      }
+      if (!matched && !isFlush) return 'none' // 参数还没收完，等后续帧
     }
 
     const prefix = carry.slice(0, openAt)
@@ -252,18 +319,29 @@ export function createToolLeakFilter(options: ToolLeakFilterOptions): ToolLeakFi
       else pendingFcClose = true
     }
 
-    if (nameM) {
-      const tool: LeakedTool = /<parameter name="/.test(body)
-        ? parseParameterBody(nameM[1], body)
-        : { name: nameM[1], input: jsonInput ?? parseJsonBody(body) ?? {} }
+    const tool = resolveLeakedTool(openTag, body, jsonInput, false)
+    if (tool) {
       leakedTools.push(tool)
       debugLog(tool)
     } else {
-      // 拿不到工具名（畸形开标签）：救不回来也不能吞字符，原样当文本输出
+      // 名字或参数不完整，救回会丢参数：原样当文本输出，不吞字符也不猜参数
       await emit(carry.slice(openAt, consumedEnd))
     }
     advance(consumedEnd)
     return 'block'
+  }
+
+  // 流结束仍未闭合时的救回尝试。收尾标签常被 Kiro 的输出上限截断
+  // （实测 name="Edit" + 完整 JSON 体，但 </tool_use> / </invoke> 一个都没来），
+  // 此时把整段当文本丢给客户端 = 工具不执行、任务中断，正是本修复要解决的症状。
+  // 只在体本身已完整可解析时救回；体被截断就返回 null，仍原样当文本输出（不猜参数）。
+  const rescueUnclosed = (openAt: number): LeakedTool | null => {
+    const gt = carry.indexOf('>', openAt)
+    if (gt === -1) return null // 开标签自己都没收完，救不了
+    // strict：JSON 截断时 parseJsonBody 返回 null，<parameter> 截断时 paramBodyComplete 为 false，
+    // 两者都会让 resolveLeakedTool 返回 null → 维持原样输出文本
+    const tool = resolveLeakedTool(carry.slice(openAt, gt + 1), carry.slice(gt + 1), null, true)
+    return tool && Object.keys(tool.input).length ? tool : null
   }
 
   const process = async (isFlush: boolean): Promise<void> => {
@@ -290,8 +368,16 @@ export function createToolLeakFilter(options: ToolLeakFilterOptions): ToolLeakFi
     const openAt = findOpener(carry)
     if (openAt !== -1) {
       if (isFlush) {
-        // 流结束仍未闭合 = 损坏的工具调用，原样当文本输出（不丢字符）
-        await emit(carry)
+        // 流结束仍未闭合：体已完整就救回（收尾标签被输出上限截断的情形）
+        const tool = rescueUnclosed(openAt)
+        if (tool) {
+          await emit(stripToolPrefix(carry.slice(0, openAt)))
+          leakedTools.push(tool)
+          debugLog(tool)
+        } else {
+          // 体也不完整 = 真损坏的工具调用，原样当文本输出（不丢字符，也不猜参数）
+          await emit(carry)
+        }
         advance(carry.length)
         return
       }

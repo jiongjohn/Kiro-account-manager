@@ -224,6 +224,126 @@ test('围栏未闭合时其后内容一律按围栏内处理（宁可不救回�
   assert.equal(r.text, s)
 })
 
+// ===== 收尾标签被输出上限截断（线上实测：Edit 调用，完整 JSON 体但无任何收尾标签）=====
+test('流结束时无收尾标签但 JSON 体完整 → 救回（回归：曾泄漏成文本、工具不执行）', async () => {
+  const input = {
+    replace_all: false,
+    file_path: '/Users/soar/project/auto-coding/src/executor-pool.ts',
+    old_string: "    this.state = 'spawning';\n    const sockPath = computeSockPath();",
+    new_string: "    this.state = 'spawning';\n    const sockPath = computeSockPath(this.idx);"
+  }
+  const leak = '<tool_use id="tooluse_4sEmx9wREFq0H1Qe8VobZ5" name="Edit">\n' + JSON.stringify(input)
+  const r = await run(['我来改一下。\n', leak])
+  assert.deepEqual(r.tools, [{ name: 'Edit', input }])
+  assert.equal(r.text.includes('<tool_use'), false, '不应把开标签泄漏成文本')
+  assert.equal(r.text.trim(), '我来改一下。')
+})
+
+test('无收尾标签且体跨帧分片 → 收齐后仍救回', async () => {
+  const leak = '<tool_use id="t1" name="Edit">{"file_path":"/a.ts","old_string":"a","new_string":"b"}'
+  const r = await runCharByChar(leak)
+  assert.deepEqual(r.tools, [{ name: 'Edit', input: { file_path: '/a.ts', old_string: 'a', new_string: 'b' } }])
+  assert.equal(r.text.trim(), '')
+})
+
+test('无收尾标签 + <parameter> 体完整 → 救回', async () => {
+  const leak = '<invoke name="Bash">\n<parameter name="command">go vet ./...</parameter>'
+  const r = await run([leak])
+  assert.deepEqual(r.tools, [{ name: 'Bash', input: { command: 'go vet ./...' } }])
+})
+
+// 截断的体绝不能猜参数：Edit 少一个 new_string 会写坏文件
+test('无收尾标签且最后一个 <parameter> 被截断 → 不救回，原样文本', async () => {
+  const leak = '<invoke name="Edit">\n<parameter name="file_path">/a.ts</parameter>\n<parameter name="new_string">半截'
+  const r = await run([leak])
+  assert.deepEqual(r.tools, [], '参数不全时不应救回')
+  assert.equal(r.text, leak, '应原样输出，不丢字符')
+})
+
+test('围栏内未闭合的标签仍原样放行，不被 flush 救回', async () => {
+  const s = '```ts\n<tool_use id="t1" name="Edit">{"file_path":"/a.ts"}'
+  const r = await run([s])
+  assert.deepEqual(r.tools, [], '围栏内的内容不该被 flush 兜底救回')
+  assert.equal(r.text, s)
+})
+
+// ===== 线上实测形态：开标签只有 id，工具名当成 <parameter name="name"> 传 =====
+// 回归：nameM 只从开标签取名字 → 取不到 → 走「原样当文本输出」分支 → 整段泄漏成文本、工具丢失
+const NAMELESS_LEAK = '<tool_use id="toolu_bdrk_01LMK1x1v6yMZKvKZQZuAvzR">\n'
+  + '<parameter name="name">Edit</parameter>\n'
+  + '<parameter name="file_path">/tmp/proj/codeListBanner.vue</parameter>\n'
+  + '<parameter name="old_string">    appendG7ReturnHighlightUtmParam(url = \'\') {\n      return x\n    },\n    getGaParam(isClick = true) {</parameter>\n'
+  + '<parameter name="new_string">    getGaParam(isClick = true) {</parameter>\n'
+  + '</invoke>'
+
+test('开标签无 name、工具名藏在 <parameter name="name"> 里 → 救回（回归：曾整段泄漏成文本）', async () => {
+  const r = await run([NAMELESS_LEAK])
+  assert.equal(r.tools.length, 1)
+  assert.equal(r.tools[0].name, 'Edit', '工具名应从 <parameter name="name"> 取到')
+  assert.equal('name' in r.tools[0].input, false, 'name 是工具名，不能混进工具参数')
+  assert.equal(r.tools[0].input.file_path, '/tmp/proj/codeListBanner.vue')
+  assert.equal(r.tools[0].input.new_string, '    getGaParam(isClick = true) {')
+  assert.equal(r.text.includes('<tool_use'), false)
+})
+
+test('该形态逐字符跨帧同样救回', async () => {
+  const r = await runCharByChar(NAMELESS_LEAK)
+  assert.equal(r.tools.length, 1)
+  assert.equal(r.tools[0].name, 'Edit')
+  assert.equal(r.text.trim(), '')
+})
+
+test('该形态无收尾标签（输出被截断）也救回', async () => {
+  const r = await run([NAMELESS_LEAK.replace('\n</invoke>', '')])
+  assert.equal(r.tools.length, 1)
+  assert.equal(r.tools[0].name, 'Edit')
+  assert.equal(r.tools[0].input.new_string, '    getGaParam(isClick = true) {')
+})
+
+// <parameter> 体也需要「顺延收尾标签」重试：old_string 正好在改这类标签时会被截断，
+// 而被截断的参数是 parseParameterBody 静默丢弃的 —— 少一个 new_string 就写坏文件
+test('<parameter> 参数值里含 </invoke> 字面量时不被截断', async () => {
+  const leak = '<invoke name="Edit">\n'
+    + '<parameter name="file_path">/a.ts</parameter>\n'
+    + '<parameter name="old_string">const s = \'</invoke>\'</parameter>\n'
+    + '<parameter name="new_string">const s = \'</tool_use>\'</parameter>\n'
+    + '</invoke>'
+  const r = await run([leak])
+  assert.equal(r.tools.length, 1)
+  assert.equal(r.tools[0].input.old_string, "const s = '</invoke>'")
+  assert.equal(r.tools[0].input.new_string, "const s = '</tool_use>'", '最后一个参数不能被静默丢掉')
+})
+
+test('开标签无 name 且体里也没有 name 参数 → 不救回，原样文本', async () => {
+  const leak = '<tool_use id="t1">\n<parameter name="file_path">/a.ts</parameter>\n</invoke>'
+  const r = await run([leak])
+  assert.deepEqual(r.tools, [], '拿不到工具名不能瞎猜')
+  assert.equal(r.text, leak, '应原样输出，不丢字符')
+})
+
+// 四个变化轴组合里最后一格：开标签无 name + JSON 体 → 名字只可能在 JSON 里
+test('开标签无 name、JSON 体带 name 字段（含嵌套 input）→ 救回', async () => {
+  const r = await run(['<tool_use id="t1">{"name":"Edit","input":{"file_path":"/a.ts","new_string":"x"}}</invoke>'])
+  assert.deepEqual(r.tools, [{ name: 'Edit', input: { file_path: '/a.ts', new_string: 'x' } }])
+})
+
+test('开标签无 name、JSON 体 name 与参数平铺 → 救回且 name 不混进参数', async () => {
+  const r = await run(['<tool_use id="t1">{"name":"Read","file_path":"/a.ts"}</tool_use>'])
+  assert.deepEqual(r.tools, [{ name: 'Read', input: { file_path: '/a.ts' } }])
+})
+
+test('开标签带 name 时，体内的 name 仍是普通参数', async () => {
+  const r = await run(['<tool_use id="t1" name="CreateFile">{"name":"foo.txt","dir":"/tmp"}</tool_use>'])
+  assert.deepEqual(r.tools, [{ name: 'CreateFile', input: { name: 'foo.txt', dir: '/tmp' } }])
+})
+
+test('该形态在围栏内仍原样放行', async () => {
+  const s = '```xml\n' + NAMELESS_LEAK + '\n```'
+  const r = await run([s])
+  assert.deepEqual(r.tools, [])
+  assert.equal(r.text, s)
+})
+
 test('流结束仍未闭合的泄漏原样输出，不丢字符', async () => {
   const broken = '正文<tool_use id="t1" name="Bash">{"command":"ls"'
   const r = await run([broken])
