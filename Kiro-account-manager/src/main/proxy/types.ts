@@ -763,11 +763,20 @@ export interface AccountStoreInfo {
 /** /admin/accounts/detail 的一行：静态信息 + 账号池运行态 */
 export interface AccountDetailRow extends AccountStoreInfo {
   isAvailable: boolean
+  /** ⚠️ 目前恒为 undefined：全仓无写入点，真正的冷却是 accountPool 的 errorCount 指数退避。
+   *  消费方应改用 errorCount + quotaExhaustedAt 判断。 */
   cooldownUntil?: number
   suspendedAt?: number
   suspendReason?: string
+  /** ⚠️ 目前恒为 undefined：唯一写入者 accountPool.updateQuota 全仓无调用点 */
   quotaUsed?: number
+  /** ⚠️ 同上，恒为 undefined */
   quotaLimit?: number
+  /** 配额耗尽时间戳。反代用它跳过账号（isQuotaExhausted），是「这个账号现在能不能用」的真信号；
+   *  注意 402/429 只写这个字段与 errorCount，**不会**把 isAvailable 置 false。 */
+  quotaExhaustedAt?: number
+  /** 下次配额重置时间戳 */
+  quotaResetAt?: number
   tokenExpiresAt?: number
   lastUsed?: number
   requestCount: number
