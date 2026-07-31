@@ -25,7 +25,9 @@ const LEDGER_FILE = 'kiro-usage-ledger.json'
 const OVERFLOW = '__overflow__'
 const LEDGER_VERSION = 1
 const DAY_MS = 24 * 3600 * 1000
-const DAY_RE = /^\d{4}-\d{2}-\d{2}$/
+// 月/日必须真实：宽松的 \d{2} 会让 "2026-99-99" 过关，而 '9' > '0' 使它躲过所有裁剪、
+// '9' > '1' 又使 query() 永远查不到——和 "NaN-NaN-NaN" 同一形态的不死不可见行，换条路进来。
+const DAY_RE = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/
 
 const pad2 = (n: number): string => String(n).padStart(2, '0')
 
@@ -138,8 +140,12 @@ export class UsageLedger {
   private pending = 0
   private flushing = false
   private flushScheduled = false
+  private flushGeneration = 0
   private flushFailedAt = 0
+  private lastFailureLogAt = 0
   private lastPrune = 0
+  /** 持续故障时的日志复打间隔 */
+  private static readonly FAILURE_RELOG_MS = 5 * 60_000
   private timer: NodeJS.Timeout | null = null
   private readonly flushIntervalMs: number
   private readonly flushEveryChanges: number
@@ -243,33 +249,46 @@ export class UsageLedger {
   async flush(): Promise<void> {
     if (!this.filePath || this.pending === 0 || this.flushing) return
     this.flushing = true
+    const gen = ++this.flushGeneration
     const flushed = this.pending          // 快照：写盘期间新来的 add() 不能被抹掉
     const target = this.filePath
     const tmp = `${target}.tmp.${process.pid}`
     try {
       await fs.promises.writeFile(tmp, this.serialize(), 'utf-8')
+      if (gen !== this.flushGeneration) {
+        // 写盘期间 flushSync 已经把更新的快照 rename 上去了。两份 payload 都完整，
+        // 但我们手里这份更旧——盖回去就是一次无日志、无重试的静默回滚（详见 N1 时序）。
+        void fs.promises.unlink(tmp).catch(() => {})
+        return                            // 刻意不 settleSuccess：这批增量没落地，pending 要留着
+      }
       await fs.promises.rename(tmp, target)   // 同目录 rename 是原子的，避免半截文件
       this.settleSuccess(flushed)
     } catch (e) {
-      this.settleFailure(e)
+      this.settleFailure(e, tmp)
     } finally {
       this.flushing = false
     }
   }
 
-  /** 同步落盘，只给 stop()（进程要退出，等不了 promise）和 initialize() 重入用 */
+  /**
+   * ⚠️ 绝不可在响应路径调用：同步全量落盘会冻住所有在飞的 SSE 流（见文件头 C1，20000 行实测 17.6ms）。
+   * 只给 stop()（进程要退出，等不了 promise）和 initialize() 重入用。
+   * 这是 C1 唯一的回归入口——在 emitResponse() 里手滑调一次，ms 级尖刺就原封不动回来，且没有测试会报警。
+   */
   flushSync(): void {
     if (!this.filePath || this.pending === 0) return
     const flushed = this.pending
+    // 抢生效权：在飞的异步 flush 发现 generation 变了就自愿放弃 rename，不拿旧快照盖我们这份新的
+    this.flushGeneration += 1
     // tmp 名带 .sync 后缀：万一异步 flush 正在写它那个 tmp，两边不能踩同一个文件，
-    // 否则交错内容 rename 过去就是坏账本。各写各的 tmp，谁后 rename 谁生效，两份都是完整 payload。
+    // 否则交错内容 rename 过去就是坏账本。
     const tmp = `${this.filePath}.tmp.${process.pid}.sync`
     try {
       fs.writeFileSync(tmp, this.serialize(), 'utf-8')
       fs.renameSync(tmp, this.filePath)
       this.settleSuccess(flushed)
     } catch (e) {
-      this.settleFailure(e)
+      this.settleFailure(e, tmp)
     }
   }
 
@@ -315,22 +334,34 @@ export class UsageLedger {
   private settleSuccess(flushed: number): void {
     // 必须减去发起时的快照，不能置 0：否则异步写盘期间来的 add() 会被静默丢掉
     this.pending = Math.max(0, this.pending - flushed)
+    if (this.flushFailedAt !== 0) {
+      // 恢复必须留痕：否则运维只看到一条孤立的失败日志，无法判断当前是好是坏
+      console.error('[UsageLedger] flush recovered')
+      // 复打闸门一并复位：恢复之后再失败必须立刻出声，不能被上一轮的 5 分钟窗口吞掉
+      this.lastFailureLogAt = 0
+    }
     this.flushFailedAt = 0
   }
 
-  private settleFailure(e: unknown): void {
-    // 只在「从成功转失败」的那一次打日志，否则 4 万次/日的请求量会把 stderr 刷爆
-    const firstFailure = this.flushFailedAt === 0
-    this.flushFailedAt = Date.now()
-    if (firstFailure) {
-      console.error('[UsageLedger] flush failed, backing off:', (e as Error).message)
-    }
+  private settleFailure(e: unknown, tmp: string): void {
+    // 清掉半截 tmp，否则写盘失败会在 userData 里留一个 MB 级孤儿文件长期不动
+    void fs.promises.unlink(tmp).catch(() => {})
+    const now = Date.now()
+    this.flushFailedAt = now
+    // 首次失败必打；之后每 5 分钟复打一次。只打一次的话长期故障就完全静默了，
+    // 而这个模块存在的意义就是给运维提供可见性，自己哑掉是最坏的失败模式。
+    // 复打闸门必须用独立的 lastFailureLogAt：flushFailedAt 兼着退避闸门 + 失败态标志两职，再塞一职会破坏退避。
+    if (now - this.lastFailureLogAt < UsageLedger.FAILURE_RELOG_MS) return
+    this.lastFailureLogAt = now
+    console.error('[UsageLedger] flush failed, backing off:', (e as Error).message)
   }
 
   /** 攒够阈值就把落盘挪出当前请求（setImmediate），绝不在响应回调里同步写盘 */
   private markDirty(): void {
     this.pending += 1
     if (this.pending < this.flushEveryChanges) return
+    // 两个旗标各管一段，别混：flushScheduled 管同一 tick 内的 burst（此时 flush() 还没跑，
+    // flushing 必然是 false）；flushing 管后续 tick 里落在写盘窗口内的 add。
     if (this.flushScheduled || this.flushing) return
     // 失败退避：期间不由 add() 触发重试，避免每个请求都重试一次全量落盘（重试风暴）
     if (Date.now() - this.flushFailedAt < FLUSH_RETRY_COOLDOWN_MS) return

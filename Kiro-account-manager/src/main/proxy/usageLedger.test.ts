@@ -188,7 +188,7 @@ test('落盘失败后退避，不再每个请求都重试', async () => {
     await waitFor(() => attempts >= 1)
     await tick()
     await tick()
-    assert.equal(attempts, 1)      // 健康时 20/3 = 6 次；并发写保护把这一批压成 1 次
+    assert.equal(attempts, 1)      // 健康时 20/3 = 6 次；同一 tick 的 burst 由 flushScheduled 压成 1 次
 
     for (let i = 0; i < 20; i++) l.add(mk())   // 退避窗口内继续来请求
     await tick()
@@ -212,11 +212,16 @@ test('磁盘与上游的脏值都净化成数字，不产出字符串/NaN/null',
       credits: '1.5',                      // 字符串：直接 += 会拼成 "1.50.25"
       responseTimeMsSum: 1000, firstAt: T, lastAt: T
       // reasoningTokens 整个缺失：undefined += n 会变 NaN，落盘序列化成 null
+    }, {
+      // day 非法：'9' > '0' 会让它躲过裁剪、'9' > '1' 又让 query 查不到，必须整行丢掉
+      day: '2026-99-99', accountId: 'acc-2', apiKeyId: 'k', model: 'm', clientIP: 'ip',
+      requests: 99, credits: 99
     }]
   }))
 
   const l = new UsageLedger()
   l.initialize(dir)
+  assert.equal(l.query('2000-01-01', '2100-01-01').length, 1)   // "2026-99-99" 那行被丢掉
   const loaded = l.query('2026-07-31', '2026-07-31')[0]
   assert.equal(typeof loaded.credits, 'number')
   assert.equal(loaded.credits, 1.5)
@@ -279,4 +284,91 @@ test('overflow 行重载后不占用当日配额', () => {
   const normals = b.query('2026-07-31', '2026-07-31').filter(r => r.accountId !== '__overflow__')
   assert.equal(normals.length, 3)          // overflow 行若计入 keysPerDay，这里会被折叠成 2
   assert.ok(normals.some(r => r.clientIP === '10.9.9.9'))
+})
+
+function diskRequests(p: string): number {
+  const parsed = JSON.parse(fs.readFileSync(p, 'utf-8')) as { rows: { requests: number }[] }
+  return parsed.rows.reduce((s, r) => s + r.requests, 0)
+}
+
+/**
+ * 把异步写盘拖慢，制造「写盘窗口内又来请求 + flushSync 插队」的竞态窗口。
+ * writes() 统计真正落到 tmp 上的次数——断言前必须等它推进，
+ * 不能等 tmp 文件出现：拖慢期间 tmp 还没建出来，那个条件会瞬间为真从而漏掉竞态。
+ */
+function slowWriteFile(delayMs: number): { restore: () => void; writes: () => number } {
+  const orig = fs.promises.writeFile
+  let completed = 0
+  ;(fs.promises as { writeFile: unknown }).writeFile = async (...args: unknown[]): Promise<void> => {
+    await new Promise(resolve => setTimeout(resolve, delayMs))
+    await (orig as (...a: unknown[]) => Promise<void>)(...args)
+    completed += 1
+  }
+  return {
+    restore: () => {
+      ;(fs.promises as { writeFile: unknown }).writeFile = orig
+    },
+    writes: () => completed
+  }
+}
+
+test('flushSync 抢生效权，在飞的旧快照不得盖回磁盘', async () => {
+  const dir = tmpDir()
+  const p = path.join(dir, LEDGER)
+  const l = new UsageLedger({ flushEveryChanges: 3, flushIntervalMs: 3_600_000 })
+  l.initialize(dir)
+  const hooks = slowWriteFile(80)
+  try {
+    l.add(mk())
+    l.add(mk())
+    l.add(mk())                              // 触发异步 flush，序列化 3 笔后进入写盘窗口
+    await tick()
+    l.add(mk({ clientIP: '10.0.0.8' }))
+    l.add(mk({ clientIP: '10.0.0.9' }))      // 窗口内又来 2 笔
+    l.stop()                                 // flushSync 写出全部 5 笔并 rename
+
+    assert.equal(diskRequests(p), 5)         // 此刻磁盘是新快照
+    await waitFor(() => hooks.writes() >= 1, 2000)          // 在飞那次的 tmp 写完了
+    await new Promise(resolve => setTimeout(resolve, 30))    // 给它的 rename/unlink 收尾
+    assert.equal(diskRequests(p), 5, '旧快照(3 笔)不得把新快照(5 笔)盖回去')
+    assert.equal(fs.existsSync(`${p}.tmp.${process.pid}`), false, '放弃 rename 后要清掉 tmp')
+  } finally {
+    hooks.restore()
+  }
+})
+
+test('持续故障不静默：首次失败打日志，恢复也打', async () => {
+  const dir = tmpDir()
+  const l = new UsageLedger({ flushEveryChanges: 2, flushIntervalMs: 3_600_000 })
+  l.initialize(dir)
+
+  const origErr = console.error
+  const lines: string[] = []
+  console.error = (...args: unknown[]): void => { lines.push(args.join(' ')) }
+  const origWrite = fs.promises.writeFile
+  ;(fs.promises as { writeFile: unknown }).writeFile = async (): Promise<void> => {
+    throw new Error('ENOSPC: no space left on device')
+  }
+  try {
+    l.add(mk())
+    l.add(mk())
+    await waitFor(() => lines.length > 0)
+    assert.ok(lines.some(x => x.includes('flush failed')), '首次失败必须留痕')
+
+    ;(fs.promises as { writeFile: unknown }).writeFile = origWrite
+    await l.flush()                          // 恢复
+    assert.ok(lines.some(x => x.includes('flush recovered')), '恢复也必须留痕')
+
+    // 恢复后再失败：必须立刻出声，不能被上一轮的 5 分钟复打闸门吞掉
+    const before = lines.filter(x => x.includes('flush failed')).length
+    ;(fs.promises as { writeFile: unknown }).writeFile = async (): Promise<void> => {
+      throw new Error('EACCES: permission denied')
+    }
+    l.add(mk())
+    l.add(mk())
+    await waitFor(() => lines.filter(x => x.includes('flush failed')).length > before)
+  } finally {
+    ;(fs.promises as { writeFile: unknown }).writeFile = origWrite
+    console.error = origErr
+  }
 })
