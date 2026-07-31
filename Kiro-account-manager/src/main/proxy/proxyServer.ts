@@ -38,6 +38,7 @@ import {
 } from './translator'
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
+import { usageLedger } from './usageLedger'
 import { loadSteeringDocuments, formatSteeringForPrompt, type SteeringDocument } from './steeringLoader'
 
 
@@ -3073,7 +3074,8 @@ export class ProxyServer {
           this.recordRequestFailed()
           const errStatusCode = error.message.match(/(\d{3})/)?.[1]
           this.accountPool.recordError(account.id, errStatusCode ? classifyError(parseInt(errStatusCode)) : ErrorType.RECOVERABLE, errStatusCode ? parseInt(errStatusCode) : undefined)
-          this.emitResponse({ path: '/v1/chat/completions', model, status: 500, error: error.message })
+          // accountId 必带：流已选到账号，失败也要计到该账号名下（账本按账号维度归集）
+          this.emitResponse({ path: '/v1/chat/completions', model, status: 500, error: error.message, accountId: account.id })
           this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
         },
@@ -3503,7 +3505,8 @@ export class ProxyServer {
           this.recordRequestFailed()
           const errStatusCode2 = error.message.match(/(\d{3})/)?.[1]
           this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
-          this.emitResponse({ path: '/v1/messages', model, status: 500, error: error.message })
+          // accountId 必带：流已选到账号，失败也要计到该账号名下（账本按账号维度归集）
+          this.emitResponse({ path: '/v1/messages', model, status: 500, error: error.message, accountId: account.id })
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
         },
@@ -3544,13 +3547,14 @@ export class ProxyServer {
         }
         res.end()
       }
-      this.emitResponse({ path, status: statusCode, error: error.message })
+      // accountId/model 与紧邻的 recordRequest 保持一致：这里的失败已归属到具体账号
+      this.emitResponse({ path, model, status: statusCode, error: error.message, accountId: account.id })
       this.recordRequest({ path, model, accountId: account.id, responseTime: startTime ? Date.now() - startTime : 0, success: false, error: error.message })
       return
     }
 
     this.sendError(res, statusCode, error.message, this.isAnthropicPath(path) ? 'anthropic' : 'openai')
-    this.emitResponse({ path, status: statusCode, error: error.message })
+    this.emitResponse({ path, model, status: statusCode, error: error.message, accountId: account.id })
     this.recordRequest({ path, model, accountId: account.id, responseTime: startTime ? Date.now() - startTime : 0, success: false, error: error.message })
   }
 
@@ -3963,6 +3967,22 @@ export class ProxyServer {
     const withIp = { ...info, clientIP: info.clientIP ?? store?.clientIP }
     // 维度统计：按 API Key / 来源 IP / 模型聚合（含缓存命中率明细）
     this.recordDimensionStats(withIp, store?.apiKeyId)
+    // 用量账本：多一个账号维度并持久化，供外部大盘按日拉取。
+    // add() 是纯内存 Map 累加（实测 p99 1.1µs），落盘由账本自己异步调度，不在本路径上。
+    usageLedger.add({
+      accountId: withIp.accountId,
+      apiKeyId: store?.apiKeyId,
+      model: withIp.model,
+      clientIP: withIp.clientIP,
+      status: withIp.status,
+      inputTokens: withIp.inputTokens,
+      outputTokens: withIp.outputTokens,
+      cacheReadTokens: withIp.cacheReadTokens,
+      cacheWriteTokens: withIp.cacheWriteTokens,
+      reasoningTokens: withIp.reasoningTokens,
+      credits: withIp.credits,
+      responseTimeMs: withIp.responseTime
+    })
     this.events.onResponse?.(withIp)
     this.captureIfActive(withIp)
   }

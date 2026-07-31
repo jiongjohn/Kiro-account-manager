@@ -31,6 +31,7 @@ import {
 import { openaiToKiro } from './proxy/translator'
 import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
+import { usageLedger } from './proxy/usageLedger'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import {
@@ -350,6 +351,9 @@ function initProxyServer(): ProxyServer {
 
   // 确保日志存储已初始化（app.whenReady 中已调用，此处兜底）
   proxyLogStore.initialize(app.getPath('userData'))
+  // 用量账本同样兜底：必须在反代 start() 收第一个请求之前拿到 filePath，
+  // 否则 flush() 直接 return，早期请求只留在内存里、关机即丢。initialize 可重入。
+  usageLedger.initialize(app.getPath('userData'))
 
   // 从 store 加载保存的配置，如果没有则使用默认配置
   const savedConfig = store?.get('proxyConfig') as Partial<ProxyConfig> | undefined
@@ -2489,6 +2493,8 @@ function handleProtocolUrl(url: string): void {
 app.whenReady().then(async () => {
   // 初始化日志系统（尽早拦截，确保所有 console 输出都进入日志存储）
   proxyLogStore.initialize(app.getPath('userData'))
+  // 用量账本：读回历史 + 启动周期落盘。必须早于任何反代启动路径（含 autoStart）
+  usageLedger.initialize(app.getPath('userData'))
   interceptConsole()
 
   // 启动 Kiro IDE token 文件监听（反向同步：IDE 自己 refresh 后把新 token 同步回反代 store）
@@ -7427,7 +7433,12 @@ app.on('window-all-closed', () => {
 app.on('will-quit', async (event) => {
   // 防止重复处理
   if (isQuitting) return
-  
+
+  // 用量账本最后一次落盘。必须放在这里（同步、无条件）而不是下面 try 块里：
+  // will-quit 有两条出口（保存数据分支 / else 直接 unregisterProtocol），
+  // 且超时 forceQuitTimer 会直接 app.exit(0)，只有这里才能保证最近 30s 的账不丢。
+  usageLedger.stop()   // 最后一次落盘，别把最近 30s 丢掉
+
   // 停止主进程池 token 刷新调度器
   stopMainPoolTokenRefresh()
 
