@@ -38,7 +38,7 @@ import {
 } from './translator'
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
-import { usageLedger } from './usageLedger'
+import { usageLedger, dayOf, DEFAULT_RETAIN_DAYS } from './usageLedger'
 import { loadSteeringDocuments, formatSteeringForPrompt, type SteeringDocument } from './steeringLoader'
 
 
@@ -2097,6 +2097,9 @@ export class ProxyServer {
     } else if (path === '/admin/logs' && method === 'GET') {
       // 获取最近日志
       this.handleAdminLogs(res)
+    } else if (path === '/admin/usage/daily' && method === 'GET') {
+      // 用量账本按日查询（供外部大盘拉取）
+      this.handleAdminUsageDaily(req, res)
     } else if (path === '/admin/cache/clear' && method === 'POST') {
       // 清除内存缓存（conversationId 映射、模型缓存、prompt cache）
       const { clearAllCaches } = require('./kiroApi')
@@ -2211,6 +2214,33 @@ export class ProxyServer {
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({
       recentRequests: this.stats.recentRequests.slice(-100)
+    }))
+  }
+
+  /** 管理 API - 用量账本按日查询。默认今天；区间上限 92 天，防一次拉全量 */
+  private handleAdminUsageDaily(req: http.IncomingMessage, res: http.ServerResponse): void {
+    // 注意：handleAdminApi 收到的 path 已剥掉 query string，from/to 必须自己从 req.url 解析
+    const url = new URL(req.url || '/', 'http://localhost')
+    const today = dayOf(Date.now())
+    const from = url.searchParams.get('from') || today
+    const to = url.searchParams.get('to') || today
+    const isDay = (s: string): boolean => /^\d{4}-\d{2}-\d{2}$/.test(s)
+    if (!isDay(from) || !isDay(to) || from > to) {
+      this.sendError(res, 400, 'Invalid from/to (expect YYYY-MM-DD, from <= to)')
+      return
+    }
+    const spanDays = Math.floor((Date.parse(`${to}T00:00:00`) - Date.parse(`${from}T00:00:00`)) / 86400000) + 1
+    if (spanDays > 92) {
+      this.sendError(res, 400, 'Range too wide (max 92 days)')
+      return
+    }
+    const rows = usageLedger.query(from, to)
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({
+      from, to, generatedAt: Date.now(),
+      retainedDays: DEFAULT_RETAIN_DAYS,
+      truncated: rows.some(r => r.accountId === '__overflow__'),
+      rows
     }))
   }
 
