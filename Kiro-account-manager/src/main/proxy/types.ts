@@ -737,3 +737,39 @@ export interface KiroUsageEvent {
   outputTokens?: number
   totalTokens?: number
 }
+
+// ============ 账号详情（供外部运维大盘只读） ============
+
+/** 由 main 进程从 electron-store 的 accountData 提取的账号静态信息 */
+export interface AccountStoreInfo {
+  id: string
+  email?: string
+  nickname?: string
+  idp?: string
+  subscriptionType?: string
+  subscriptionTitle?: string
+  subscriptionExpiresAt?: number
+  daysRemaining?: number
+  usageCurrent?: number
+  usageLimit?: number
+  /** 注意单位是 0~1 的比例（store 里 usage.percentUsed 实测 0.86926 = 86.926%），不是百分数 */
+  usagePercent?: number
+  nextResetDate?: string
+  bonuses?: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
+  status?: string
+  lastError?: string
+}
+
+/** /admin/accounts/detail 的一行：静态信息 + 账号池运行态 */
+export interface AccountDetailRow extends AccountStoreInfo {
+  isAvailable: boolean
+  cooldownUntil?: number
+  suspendedAt?: number
+  suspendReason?: string
+  quotaUsed?: number
+  quotaLimit?: number
+  tokenExpiresAt?: number
+  lastUsed?: number
+  requestCount: number
+  errorCount: number
+}

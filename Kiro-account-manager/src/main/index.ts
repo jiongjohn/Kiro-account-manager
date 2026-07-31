@@ -32,6 +32,7 @@ import { openaiToKiro } from './proxy/translator'
 import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
 import { usageLedger } from './proxy/usageLedger'
+import type { AccountStoreInfo } from './proxy/types'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import {
@@ -560,6 +561,34 @@ function initProxyServer(): ProxyServer {
   proxyServer.setWebhookTrigger((event, payload) => {
     // 通过 IPC 转发到 renderer，由 useWebhookStore.triggerEvent 实际发送
     mainWindow?.webContents.send('proxy-webhook-trigger', { event, payload })
+  })
+
+  // 账号静态信息（额度/订阅）只在 main 的 electron-store 里，反代自身读不到 → 注入只读 provider
+  proxyServer.setAccountDetailProvider(() => {
+    const data = store?.get('accountData') as
+      { accounts?: Record<string, Record<string, unknown>> } | undefined
+    return Object.values(data?.accounts ?? {}).map((a) => {
+      const usage = (a.usage ?? {}) as Record<string, unknown>
+      const sub = (a.subscription ?? {}) as Record<string, unknown>
+      return {
+        id: String(a.id ?? ''),
+        email: a.email as string | undefined,
+        nickname: a.nickname as string | undefined,
+        idp: a.idp as string | undefined,
+        subscriptionType: sub.type as string | undefined,
+        subscriptionTitle: sub.title as string | undefined,
+        subscriptionExpiresAt: sub.expiresAt as number | undefined,
+        daysRemaining: sub.daysRemaining as number | undefined,
+        usageCurrent: usage.current as number | undefined,
+        usageLimit: usage.limit as number | undefined,
+        // 实测 store 里 percentUsed 是 0~1 的比例（0.86926 = 86.926%），照原样透出不换算
+        usagePercent: usage.percentUsed as number | undefined,
+        nextResetDate: usage.nextResetDate as string | undefined,
+        bonuses: usage.bonuses as AccountStoreInfo['bonuses'],
+        status: a.status as string | undefined,
+        lastError: a.lastError as string | undefined
+      }
+    })
   })
 
   // Enterprise profileArn 自愈持久化：运行时首次解析出真实 profileArn 时，

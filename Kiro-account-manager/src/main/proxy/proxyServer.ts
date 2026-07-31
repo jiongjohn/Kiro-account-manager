@@ -18,7 +18,9 @@ import type {
   ProxyStats,
   DimensionCell,
   ProxyAccount,
-  TokenRefreshCallback
+  TokenRefreshCallback,
+  AccountStoreInfo,
+  AccountDetailRow
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
 import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, type KiroModel } from './kiroApi'
@@ -2074,6 +2076,9 @@ export class ProxyServer {
     } else if (path === '/admin/accounts' && method === 'GET') {
       // 获取账号列表
       this.handleAdminAccounts(res)
+    } else if (path === '/admin/accounts/detail' && method === 'GET') {
+      // 账号完整详情（额度/订阅/状态），供外部运维大盘
+      this.handleAdminAccountsDetail(res)
     } else if (path === '/admin/config' && method === 'GET') {
       // 获取配置
       this.handleAdminConfig(res)
@@ -2154,6 +2159,44 @@ export class ProxyServer {
       available: accounts.filter(a => a.isAvailable).length,
       accounts
     }))
+  }
+
+  /**
+   * 管理 API - 账号完整详情。
+   * 以 store 里的账号为准（那是「这台机器上有哪些账号」的事实），left-join 账号池运行态：
+   * 池里只有被选中参与轮询的账号，直接遍历池会漏掉未选中的账号。
+   */
+  private handleAdminAccountsDetail(res: http.ServerResponse): void {
+    const storeRows = (() => {
+      try { return this.accountDetailProvider?.() ?? [] } catch (e) {
+        proxyLogger.warn('ProxyServer', `accountDetailProvider failed: ${(e as Error).message}`)
+        return []
+      }
+    })()
+    const pool = new Map(this.accountPool.getAllAccounts().map(a => [a.id, a]))
+
+    const accounts: AccountDetailRow[] = storeRows.map(s => {
+      const p = pool.get(s.id)
+      return {
+        ...s,
+        isAvailable: p ? p.isAvailable !== false : false,
+        cooldownUntil: p?.cooldownUntil,
+        suspendedAt: p?.suspendedAt,
+        suspendReason: p?.suspendReason,
+        quotaUsed: p?.quotaUsed,
+        quotaLimit: p?.quotaLimit,
+        tokenExpiresAt: p?.expiresAt,
+        lastUsed: p?.lastUsed,
+        requestCount: p?.requestCount || 0,
+        errorCount: p?.errorCount || 0
+      }
+    })
+
+    const quota = this.accountPool.getQuotaStatus()
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    // 池四态必须嵌在 pool 下（旧的 /admin/accounts 是平铺的，两者刻意不同）：
+    // 外部客户端读的是 data["pool"]，平铺会让它拿到空对象。
+    res.end(JSON.stringify({ generatedAt: Date.now(), pool: quota, accounts }))
   }
 
   /**
@@ -3860,6 +3903,13 @@ export class ProxyServer {
   /** 注入 webhook 触发器（由 main/index.ts 注入，调用 renderer 的 webhook store） */
   setWebhookTrigger(fn: (event: string, payload: Record<string, unknown>) => void): void {
     this.webhookTrigger = fn
+  }
+
+  private accountDetailProvider?: () => AccountStoreInfo[]
+
+  /** 注入账号静态信息提供者（由 main/index.ts 从 electron-store 读；反代自身拿不到该数据） */
+  setAccountDetailProvider(fn: () => AccountStoreInfo[]): void {
+    this.accountDetailProvider = fn
   }
 
   /** 关键事件去重时间戳（5 分钟内同事件不重复推） */
