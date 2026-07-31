@@ -3,15 +3,48 @@
 //
 // 刻意不 import electron：本文件用 `node --test` 直跑 .ts 源码做单测，
 // userData 目录由调用方（main/index.ts）通过 initialize(dir) 传入。
+// 也因此错误只走 console.error 而不用 proxyLogger —— logger.ts 顶层 import electron，
+// 一引入本文件就跑不了 node --test。
+//
+// 落盘策略：本模块挂在反代响应回调上，而反代转发的是流式 SSE，Node 单线程里同步写盘
+// 会把所有在飞的流一起冻住（实测 20000 行 JSON.stringify + writeFileSync 约 18ms，
+// 最坏 180000 行 156ms）。所以阈值触发的落盘一律 setImmediate + fs.promises 异步做，
+// 只有 stop() / initialize() 这两个「等不了 promise」的场合才用 flushSync()。
 import fs from 'fs'
 import path from 'path'
 
 /** 单日键数上限：超出后新组合归入只保模型维度的 __overflow__ 桶，防高基数撑爆内存 */
 export const DEFAULT_MAX_KEYS_PER_DAY = 2000
-/** 账本保留天数：读盘时裁掉更早的天 */
+/** 账本保留天数：读盘时和进程内周期裁剪都用它 */
 export const DEFAULT_RETAIN_DAYS = 90
+/** 裁剪闸门间隔 1 小时：长跑进程必须在进程内裁，不能只靠重启 */
+export const PRUNE_INTERVAL_MS = 60 * 60 * 1000
+/** 落盘失败后的退避窗口：期间不再由 add() 触发重试，交给周期定时器 */
+export const FLUSH_RETRY_COOLDOWN_MS = 60_000
 const LEDGER_FILE = 'kiro-usage-ledger.json'
 const OVERFLOW = '__overflow__'
+const LEDGER_VERSION = 1
+const DAY_MS = 24 * 3600 * 1000
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/
+
+const pad2 = (n: number): string => String(n).padStart(2, '0')
+
+/**
+ * 把任何来源的数值净化成有限数字。
+ * 必须做：这些值进的是**累加行**，一次污染永久留存——上游 kiroApi 取 token 时没有
+ * typeof 守卫（kiroApi.ts:1786），字符串进来后 `row.inputTokens += '100'` 会把整行变成
+ * 字符串并写进大盘读的文件；缺字段则 `undefined += n` 得 NaN，JSON 序列化成 null，
+ * 下次 load 回来历史静默清零。沿用同目录 clientConfig.ts:266 的 Number.isFinite 范式。
+ */
+function num(v: unknown): number {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : 0
+}
+
+/** credits 收敛到 6 位小数：纯为观感（0.1+0.2 会写出 0.30000000000000004），6 位正好对上下游 Numeric(18,6)。内部累加保持全精度 */
+function round6(v: number): number {
+  return Math.round(v * 1e6) / 1e6
+}
 
 export interface LedgerRow {
   day: string            // YYYY-MM-DD（宿主机本地时区）
@@ -63,8 +96,37 @@ export interface UsageLedgerOptions {
 /** 本地时区的 YYYY-MM-DD。不用 toISOString()——那是 UTC，会把 08:00 前的请求算到前一天 */
 export function dayOf(ts: number): string {
   const d = new Date(ts)
-  const p = (n: number): string => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+}
+
+/** 磁盘上的一行不可信：逐字段归一，day 不合法就整行丢掉（顺手挡住 "NaN-NaN-NaN" 之类回流） */
+function sanitizeRow(raw: unknown): LedgerRow | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Record<string, unknown>
+  const day = typeof r.day === 'string' ? r.day : ''
+  if (!DAY_RE.test(day)) return null
+  const str = (v: unknown, dflt: string): string => (typeof v === 'string' && v ? v : dflt)
+  return {
+    day,
+    accountId: str(r.accountId, 'unknown'),
+    apiKeyId: str(r.apiKeyId, 'anonymous'),
+    model: str(r.model, 'unknown'),
+    clientIP: str(r.clientIP, 'unknown'),
+    requests: num(r.requests),
+    success: num(r.success),
+    failed: num(r.failed),
+    rateLimited: num(r.rateLimited),
+    unavailable: num(r.unavailable),
+    inputTokens: num(r.inputTokens),
+    outputTokens: num(r.outputTokens),
+    cacheReadTokens: num(r.cacheReadTokens),
+    cacheWriteTokens: num(r.cacheWriteTokens),
+    reasoningTokens: num(r.reasoningTokens),
+    credits: num(r.credits),
+    responseTimeMsSum: num(r.responseTimeMsSum),
+    firstAt: num(r.firstAt),
+    lastAt: num(r.lastAt)
+  }
 }
 
 export class UsageLedger {
@@ -74,6 +136,10 @@ export class UsageLedger {
   private readonly retainDays: number
   private filePath: string | null = null
   private pending = 0
+  private flushing = false
+  private flushScheduled = false
+  private flushFailedAt = 0
+  private lastPrune = 0
   private timer: NodeJS.Timeout | null = null
   private readonly flushIntervalMs: number
   private readonly flushEveryChanges: number
@@ -86,69 +152,36 @@ export class UsageLedger {
   }
 
   /**
-   * 读盘 + 裁剪 + 启动周期 flush。
+   * 读盘 + 裁剪闸门复位 + 启动周期 flush。
    * @param dir  userData 目录（由 main 进程传入，本模块不依赖 electron）
    * @param now  仅测试注入；生产不传
    */
   initialize(dir: string, now?: number): void {
+    const at = now ?? Date.now()
+    // 重入（代理重启 / 端口切换 / 设置变更时 main 会重走 init）：先把未落盘增量同步写掉，
+    // 否则紧随的 load() 会 clear 掉最多 flushEveryChanges 个请求的账。必须同步版——
+    // 异步会和 load() 抢同一个文件。
+    this.flushSync()
+    try {
+      fs.mkdirSync(dir, { recursive: true })
+    } catch (e) {
+      console.error('[UsageLedger] mkdir failed:', (e as Error).message)
+    }
     this.filePath = path.join(dir, LEDGER_FILE)
-    this.load(now ?? Date.now())
+    this.lastPrune = at
+    this.load(at)
     if (this.timer) clearInterval(this.timer)
-    this.timer = setInterval(() => this.flush(), this.flushIntervalMs)
+    this.timer = setInterval(() => {
+      this.pruneIfNeeded(Date.now())
+      void this.flush()
+    }, this.flushIntervalMs)
     // 别让定时器吊住进程退出（测试里尤其重要）
     if (typeof this.timer.unref === 'function') this.timer.unref()
   }
 
-  /** 立即落盘；无变更则跳过。绝不抛错——账本坏掉不能拖垮反代 */
-  flush(): void {
-    if (!this.filePath || this.pending === 0) return
-    try {
-      const payload = JSON.stringify({ version: 1, rows: [...this.rows.values()] })
-      const tmp = `${this.filePath}.tmp`
-      fs.writeFileSync(tmp, payload, 'utf-8')
-      fs.renameSync(tmp, this.filePath)      // 同目录 rename 是原子的，避免半截文件
-      this.pending = 0
-    } catch (e) {
-      console.error('[UsageLedger] flush failed:', (e as Error).message)
-    }
-  }
-
-  /** 退出前调用：停定时器 + 最后一次落盘 */
-  stop(): void {
-    if (this.timer) { clearInterval(this.timer); this.timer = null }
-    this.flush()
-  }
-
-  private markDirty(): void {
-    this.pending += 1
-    if (this.pending >= this.flushEveryChanges) this.flush()
-  }
-
-  private load(now: number): void {
-    this.rows.clear()
-    this.keysPerDay.clear()
-    if (!this.filePath || !fs.existsSync(this.filePath)) return
-    const cutoff = dayOf(now - this.retainDays * 24 * 3600 * 1000)
-    try {
-      const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf-8')) as { rows?: LedgerRow[] }
-      for (const row of parsed.rows ?? []) {
-        if (!row?.day || row.day < cutoff) continue
-        const key = `${row.day}|${row.accountId}|${row.apiKeyId}|${row.model}|${row.clientIP}`
-        this.rows.set(key, row)
-        if (row.accountId !== OVERFLOW) {
-          this.keysPerDay.set(row.day, (this.keysPerDay.get(row.day) ?? 0) + 1)
-        }
-      }
-    } catch (e) {
-      // 文件损坏：宁可丢历史也要让反代正常起来；下一次 flush 会把文件重写成好的
-      console.error('[UsageLedger] load failed, starting empty:', (e as Error).message)
-      this.rows.clear()
-      this.keysPerDay.clear()
-    }
-  }
-
   add(input: LedgerAddInput): void {
-    const at = input.at ?? Date.now()
+    const at = num(input.at) || Date.now()
+    const status = num(input.status)
     const day = dayOf(at)
     const accountId = input.accountId || 'unknown'
     const apiKeyId = input.apiKeyId || 'anonymous'
@@ -159,6 +192,8 @@ export class UsageLedger {
     let row = this.rows.get(key)
     if (!row) {
       if ((this.keysPerDay.get(day) ?? 0) >= this.maxKeysPerDay) {
+        // overflow 桶的 clientIP 用 '-' 而非 'unknown' 是刻意的：区分「被折叠掉」与
+        // 「本来就没上报」。这一行里只有 day 和 model 两个维度可信。
         key = `${day}|${OVERFLOW}|${OVERFLOW}|${model}|-`
         row = this.rows.get(key)
         if (!row) {
@@ -172,30 +207,172 @@ export class UsageLedger {
       }
     }
 
-    const ok = input.status >= 200 && input.status < 300
+    const ok = status >= 200 && status < 300
     row.requests += 1
     if (ok) row.success += 1
     else row.failed += 1
-    if (input.status === 429) row.rateLimited += 1
-    if (input.status === 503) row.unavailable += 1
-    row.inputTokens += input.inputTokens || 0
-    row.outputTokens += input.outputTokens || 0
-    row.cacheReadTokens += input.cacheReadTokens || 0
-    row.cacheWriteTokens += input.cacheWriteTokens || 0
-    row.reasoningTokens += input.reasoningTokens || 0
-    row.credits += input.credits || 0
-    row.responseTimeMsSum += input.responseTimeMs || 0
+    if (status === 429) row.rateLimited += 1
+    if (status === 503) row.unavailable += 1
+    row.inputTokens += num(input.inputTokens)
+    row.outputTokens += num(input.outputTokens)
+    row.cacheReadTokens += num(input.cacheReadTokens)
+    row.cacheWriteTokens += num(input.cacheWriteTokens)
+    row.reasoningTokens += num(input.reasoningTokens)
+    row.credits += num(input.credits)
+    row.responseTimeMsSum += num(input.responseTimeMs)
     if (row.firstAt === 0 || at < row.firstAt) row.firstAt = at
     if (at > row.lastAt) row.lastAt = at
     this.markDirty()
   }
 
+  // TODO 现在是 O(全部行) 全扫：大盘按天拉取、行数几千，微秒级，够用。
+  // 若行数进 10 万量级或改成秒级轮询，按 day 建二级索引 Map<day, Map<key, row>>，
+  // 顺带 flush() 可改成按天分片、只重写变更过的天。
   query(from: string, to: string): LedgerRow[] {
     const out: LedgerRow[] = []
     for (const row of this.rows.values()) {
-      if (row.day >= from && row.day <= to) out.push({ ...row })
+      if (row.day >= from && row.day <= to) out.push({ ...row, credits: round6(row.credits) })
     }
     return out
+  }
+
+  /**
+   * 异步落盘（阈值触发与周期定时器都走这条）；无变更或正在写则跳过。
+   * 绝不抛错——账本坏掉不能拖垮反代。
+   */
+  async flush(): Promise<void> {
+    if (!this.filePath || this.pending === 0 || this.flushing) return
+    this.flushing = true
+    const flushed = this.pending          // 快照：写盘期间新来的 add() 不能被抹掉
+    const target = this.filePath
+    const tmp = `${target}.tmp.${process.pid}`
+    try {
+      await fs.promises.writeFile(tmp, this.serialize(), 'utf-8')
+      await fs.promises.rename(tmp, target)   // 同目录 rename 是原子的，避免半截文件
+      this.settleSuccess(flushed)
+    } catch (e) {
+      this.settleFailure(e)
+    } finally {
+      this.flushing = false
+    }
+  }
+
+  /** 同步落盘，只给 stop()（进程要退出，等不了 promise）和 initialize() 重入用 */
+  flushSync(): void {
+    if (!this.filePath || this.pending === 0) return
+    const flushed = this.pending
+    // tmp 名带 .sync 后缀：万一异步 flush 正在写它那个 tmp，两边不能踩同一个文件，
+    // 否则交错内容 rename 过去就是坏账本。各写各的 tmp，谁后 rename 谁生效，两份都是完整 payload。
+    const tmp = `${this.filePath}.tmp.${process.pid}.sync`
+    try {
+      fs.writeFileSync(tmp, this.serialize(), 'utf-8')
+      fs.renameSync(tmp, this.filePath)
+      this.settleSuccess(flushed)
+    } catch (e) {
+      this.settleFailure(e)
+    }
+  }
+
+  /**
+   * 退出前调用：停周期定时器 + 最后一次同步落盘。
+   * 注意：stop() 之后仍接受 add()，且攒够阈值仍会异步落盘，只是不再周期落盘——
+   * 停机过程中还有在飞的请求，继续记账比丢账好。读代码的人容易以为 stop 了就丢弃。
+   */
+  stop(): void {
+    if (this.timer) { clearInterval(this.timer); this.timer = null }
+    this.flushSync()
+  }
+
+  /**
+   * 周期裁掉超过保留期的天。这个 Electron App 在 132 上常驻、几个月不重启是常态，
+   * 若只在 initialize() 裁一次，第 200 天内存里就躺着 200 天的行——这也是 flush 越来越慢的根因。
+   * 「时间戳闸门 + 周期扫」的范式照 promptCacheTracker.pruneIfNeeded 写，热路径零开销。
+   * @param now 由 initialize() 的定时器传入；测试注入
+   */
+  pruneIfNeeded(now: number): void {
+    if (now - this.lastPrune < PRUNE_INTERVAL_MS) return
+    this.lastPrune = now
+    const cutoff = dayOf(now - this.retainDays * DAY_MS)
+    let removed = 0
+    for (const [key, row] of this.rows) {
+      if (row.day < cutoff) {
+        this.rows.delete(key)
+        removed += 1
+      }
+    }
+    for (const day of this.keysPerDay.keys()) {
+      if (day < cutoff) this.keysPerDay.delete(day)
+    }
+    // 有删除就标脏，让文件跟着缩；否则只有内存变小、磁盘照旧
+    if (removed > 0) this.pending += 1
+  }
+
+  private serialize(): string {
+    const rows = [...this.rows.values()].map(row => ({ ...row, credits: round6(row.credits) }))
+    return JSON.stringify({ version: LEDGER_VERSION, rows })
+  }
+
+  private settleSuccess(flushed: number): void {
+    // 必须减去发起时的快照，不能置 0：否则异步写盘期间来的 add() 会被静默丢掉
+    this.pending = Math.max(0, this.pending - flushed)
+    this.flushFailedAt = 0
+  }
+
+  private settleFailure(e: unknown): void {
+    // 只在「从成功转失败」的那一次打日志，否则 4 万次/日的请求量会把 stderr 刷爆
+    const firstFailure = this.flushFailedAt === 0
+    this.flushFailedAt = Date.now()
+    if (firstFailure) {
+      console.error('[UsageLedger] flush failed, backing off:', (e as Error).message)
+    }
+  }
+
+  /** 攒够阈值就把落盘挪出当前请求（setImmediate），绝不在响应回调里同步写盘 */
+  private markDirty(): void {
+    this.pending += 1
+    if (this.pending < this.flushEveryChanges) return
+    if (this.flushScheduled || this.flushing) return
+    // 失败退避：期间不由 add() 触发重试，避免每个请求都重试一次全量落盘（重试风暴）
+    if (Date.now() - this.flushFailedAt < FLUSH_RETRY_COOLDOWN_MS) return
+    this.flushScheduled = true
+    setImmediate(() => {
+      this.flushScheduled = false
+      void this.flush()
+    })
+  }
+
+  private load(now: number): void {
+    this.rows.clear()
+    this.keysPerDay.clear()
+    this.pending = 0    // 内存与磁盘刚对齐，旧计数必须归零（否则失败退避的判断也会失真）
+    if (!this.filePath || !fs.existsSync(this.filePath)) return
+    const cutoff = dayOf(now - this.retainDays * DAY_MS)
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf-8')) as {
+        version?: unknown
+        rows?: unknown
+      }
+      if (num(parsed.version) !== LEDGER_VERSION) {
+        // 不硬拒：版本回滚不该丢历史，留痕后照常净化读入
+        console.error(
+          `[UsageLedger] unexpected ledger version ${String(parsed.version)}, expected ${LEDGER_VERSION}; reading anyway`
+        )
+      }
+      for (const raw of Array.isArray(parsed.rows) ? parsed.rows : []) {
+        const row = sanitizeRow(raw)
+        if (!row || row.day < cutoff) continue
+        const key = `${row.day}|${row.accountId}|${row.apiKeyId}|${row.model}|${row.clientIP}`
+        this.rows.set(key, row)
+        if (row.accountId !== OVERFLOW) {
+          this.keysPerDay.set(row.day, (this.keysPerDay.get(row.day) ?? 0) + 1)
+        }
+      }
+    } catch (e) {
+      // 文件损坏：宁可丢历史也要让反代正常起来；下一次 flush 会把文件重写成好的
+      console.error('[UsageLedger] load failed, starting empty:', (e as Error).message)
+      this.rows.clear()
+      this.keysPerDay.clear()
+    }
   }
 
   private newRow(day: string, accountId: string, apiKeyId: string, model: string, clientIP: string): LedgerRow {
