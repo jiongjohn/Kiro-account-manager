@@ -56,6 +56,8 @@ export interface LedgerAddInput {
 export interface UsageLedgerOptions {
   maxKeysPerDay?: number
   retainDays?: number
+  flushIntervalMs?: number
+  flushEveryChanges?: number
 }
 
 /** 本地时区的 YYYY-MM-DD。不用 toISOString()——那是 UTC，会把 08:00 前的请求算到前一天 */
@@ -70,10 +72,79 @@ export class UsageLedger {
   private keysPerDay = new Map<string, number>()
   private readonly maxKeysPerDay: number
   private readonly retainDays: number
+  private filePath: string | null = null
+  private pending = 0
+  private timer: NodeJS.Timeout | null = null
+  private readonly flushIntervalMs: number
+  private readonly flushEveryChanges: number
 
   constructor(opts: UsageLedgerOptions = {}) {
     this.maxKeysPerDay = opts.maxKeysPerDay ?? DEFAULT_MAX_KEYS_PER_DAY
     this.retainDays = opts.retainDays ?? DEFAULT_RETAIN_DAYS
+    this.flushIntervalMs = opts.flushIntervalMs ?? 30_000
+    this.flushEveryChanges = opts.flushEveryChanges ?? 200
+  }
+
+  /**
+   * 读盘 + 裁剪 + 启动周期 flush。
+   * @param dir  userData 目录（由 main 进程传入，本模块不依赖 electron）
+   * @param now  仅测试注入；生产不传
+   */
+  initialize(dir: string, now?: number): void {
+    this.filePath = path.join(dir, LEDGER_FILE)
+    this.load(now ?? Date.now())
+    if (this.timer) clearInterval(this.timer)
+    this.timer = setInterval(() => this.flush(), this.flushIntervalMs)
+    // 别让定时器吊住进程退出（测试里尤其重要）
+    if (typeof this.timer.unref === 'function') this.timer.unref()
+  }
+
+  /** 立即落盘；无变更则跳过。绝不抛错——账本坏掉不能拖垮反代 */
+  flush(): void {
+    if (!this.filePath || this.pending === 0) return
+    try {
+      const payload = JSON.stringify({ version: 1, rows: [...this.rows.values()] })
+      const tmp = `${this.filePath}.tmp`
+      fs.writeFileSync(tmp, payload, 'utf-8')
+      fs.renameSync(tmp, this.filePath)      // 同目录 rename 是原子的，避免半截文件
+      this.pending = 0
+    } catch (e) {
+      console.error('[UsageLedger] flush failed:', (e as Error).message)
+    }
+  }
+
+  /** 退出前调用：停定时器 + 最后一次落盘 */
+  stop(): void {
+    if (this.timer) { clearInterval(this.timer); this.timer = null }
+    this.flush()
+  }
+
+  private markDirty(): void {
+    this.pending += 1
+    if (this.pending >= this.flushEveryChanges) this.flush()
+  }
+
+  private load(now: number): void {
+    this.rows.clear()
+    this.keysPerDay.clear()
+    if (!this.filePath || !fs.existsSync(this.filePath)) return
+    const cutoff = dayOf(now - this.retainDays * 24 * 3600 * 1000)
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf-8')) as { rows?: LedgerRow[] }
+      for (const row of parsed.rows ?? []) {
+        if (!row?.day || row.day < cutoff) continue
+        const key = `${row.day}|${row.accountId}|${row.apiKeyId}|${row.model}|${row.clientIP}`
+        this.rows.set(key, row)
+        if (row.accountId !== OVERFLOW) {
+          this.keysPerDay.set(row.day, (this.keysPerDay.get(row.day) ?? 0) + 1)
+        }
+      }
+    } catch (e) {
+      // 文件损坏：宁可丢历史也要让反代正常起来；下一次 flush 会把文件重写成好的
+      console.error('[UsageLedger] load failed, starting empty:', (e as Error).message)
+      this.rows.clear()
+      this.keysPerDay.clear()
+    }
   }
 
   add(input: LedgerAddInput): void {
@@ -116,6 +187,7 @@ export class UsageLedger {
     row.responseTimeMsSum += input.responseTimeMs || 0
     if (row.firstAt === 0 || at < row.firstAt) row.firstAt = at
     if (at > row.lastAt) row.lastAt = at
+    this.markDirty()
   }
 
   query(from: string, to: string): LedgerRow[] {
