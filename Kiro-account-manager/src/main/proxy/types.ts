@@ -427,6 +427,10 @@ export interface ProxyAccount {
   // 配额追踪
   quotaUsed?: number
   quotaLimit?: number
+  // 超额（overage）：开了之后用满基础额度仍可继续请求（按次计费）。
+  // 必须带进池子——只看 quotaLimit 会把还有超额余量的账号误判成耗尽，一次都轮不到。
+  overageEnabled?: boolean
+  overageCap?: number
   quotaExhaustedAt?: number // 配额耗尽时间戳
   quotaResetAt?: number // 下次配额重置时间
   // 长期封禁追踪（区分于临时 errorCount 冷却）

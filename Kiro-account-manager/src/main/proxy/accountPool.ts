@@ -1,12 +1,15 @@
 // 多账号智能轮询管理器
 // 参考 Kiro Gateway 的 Circuit Breaker + Sticky + 指数退避 + 概率重试机制
 import type { ProxyAccount, AccountStats } from './types'
+import { isQuotaExhausted as isQuotaExhaustedByUsage } from '../../shared/quota.ts'
 
 // 错误类型分类（决定 failover 策略）
-export enum ErrorType {
-  FATAL = 'fatal',           // 请求本身有问题 → 直接返回客户端，不切号
-  RECOVERABLE = 'recoverable' // 账号问题 → 切换到下一个账号
-}
+// 用 const 对象而非 enum：enum 不是可擦除语法，node --test 的 strip-only 模式加载不了本文件
+export const ErrorType = {
+  FATAL: 'fatal',            // 请求本身有问题 → 直接返回客户端，不切号
+  RECOVERABLE: 'recoverable' // 账号问题 → 切换到下一个账号
+} as const
+export type ErrorType = (typeof ErrorType)[keyof typeof ErrorType]
 
 // 根据 HTTP 状态码和错误原因分类错误
 export function classifyError(statusCode: number, reason?: string): ErrorType {
@@ -103,6 +106,86 @@ export class AccountPool {
     this.accounts.delete(accountId)
     this.accountStats.delete(accountId)
     console.log(`[AccountPool] Removed account: ${accountId}`)
+  }
+
+  /**
+   * 批量同步账号（增量 merge，不是 clear + 全量重加）。
+   *
+   * 为什么不能 clear：clear 会把运行时攒下的 quotaExhaustedAt（402 耗尽标记）、
+   * suspendedAt（封禁标记）、errorCount（断路器退避）、用量统计全部抹掉，
+   * 于是刚被 402 踢出去的账号在下一次重同步后立刻满血复活，继续撞同一个错误。
+   * 账号增删 / 改分组 / 额度状态翻转都会触发重同步，这个抹除相当频繁。
+   *
+   * 规则：
+   *  - 传入列表里没有的账号 → 移除（含其统计）
+   *  - 已存在的账号 → 只覆盖传入的**已定义**字段（undefined 不覆盖，
+   *    避免把 proxyUrl 这类走另一条 IPC 设置的字段擦掉），运行时状态一律保留
+   *  - 新账号 → 走 addAccount
+   */
+  syncAccounts(accounts: ProxyAccount[]): { added: number; updated: number; removed: number } {
+    const incomingIds = new Set(accounts.map(a => a.id))
+
+    let removed = 0
+    for (const id of Array.from(this.accounts.keys())) {
+      if (!incomingIds.has(id)) {
+        this.accounts.delete(id)
+        this.accountStats.delete(id)
+        removed++
+      }
+    }
+
+    let added = 0
+    let updated = 0
+    for (const incoming of accounts) {
+      const existing = this.accounts.get(incoming.id)
+      if (!existing) {
+        this.addAccount(incoming)
+        added++
+        continue
+      }
+
+      // 只取传入对象里显式定义的字段
+      const patch: Partial<ProxyAccount> = {}
+      for (const [key, value] of Object.entries(incoming)) {
+        if (value !== undefined) {
+          (patch as Record<string, unknown>)[key] = value
+        }
+      }
+
+      // markNeedsRefresh 把 isAvailable 置 false 后，只有换到新 token 才有机会恢复；
+      // 否则一次刷新失败会让账号在池子里永久不可用。封禁另有 suspendedAt 兜住。
+      const tokenRefreshed = !!patch.accessToken && patch.accessToken !== existing.accessToken
+      const isAvailable = (existing.isAvailable === false && tokenRefreshed)
+        ? !this.isSuspended(existing)
+        : existing.isAvailable
+
+      this.accounts.set(incoming.id, {
+        ...existing,
+        ...patch,
+        // 运行时状态由账号池自己维护，同步方无权覆盖
+        requestCount: existing.requestCount,
+        errorCount: existing.errorCount,
+        lastUsed: existing.lastUsed,
+        cooldownUntil: existing.cooldownUntil,
+        isAvailable,
+        quotaExhaustedAt: existing.quotaExhaustedAt,
+        quotaResetAt: existing.quotaResetAt,
+        suspendedAt: existing.suspendedAt,
+        suspendReason: existing.suspendReason,
+        suspendMessage: existing.suspendMessage
+      })
+      updated++
+    }
+
+    // 账号数量变化后指针可能越界
+    if (this.accounts.size === 0) {
+      this.currentIndex = 0
+    } else if (this.currentIndex >= this.accounts.size) {
+      this.currentIndex = this.currentIndex % this.accounts.size
+    }
+
+    console.log(`[AccountPool] Synced: +${added} ~${updated} -${removed} (total ${this.accounts.size})`)
+    return { added, updated, removed }
   }
 
   // 更新账号
@@ -293,11 +376,9 @@ export class AccountPool {
     if (account.quotaExhaustedAt && account.quotaExhaustedAt > 0) {
       return true
     }
-    // 有配额数据且已用尽
-    if (account.quotaLimit && account.quotaLimit > 0 && (account.quotaUsed ?? 0) >= account.quotaLimit) {
-      return true
-    }
-    return false
+    // 有配额数据且已用尽。判定走 shared/quota，与同步准入过滤、渲染进程签名共用同一份：
+    // 这里如果只比基础 quotaLimit，准入层放行的超额账号会在池子里被判成耗尽，永远轮不到。
+    return isQuotaExhaustedByUsage(account)
   }
 
   // 获取冷却时间最短的账号

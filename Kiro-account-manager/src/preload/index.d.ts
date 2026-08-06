@@ -644,8 +644,8 @@ interface KiroApi {
   // 从反代池移除账号
   proxyRemoveAccount: (accountId: string) => Promise<{ success: boolean; accountCount?: number; error?: string }>
 
-  // 同步账号到反代池（批量更新）
-  proxySyncAccounts: (accounts: Array<{ id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }>) => Promise<{ success: boolean; accountCount?: number; error?: string }>
+  // 同步账号到反代池（批量增量更新；额度耗尽 / 被封禁的账号由主进程挡下，见返回的 skipped）
+  proxySyncAccounts: (accounts: Array<{ id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string; groupId?: string; quotaUsed?: number; quotaLimit?: number; overageEnabled?: boolean; overageCap?: number; lastError?: string }>) => Promise<{ success: boolean; accountCount?: number; skippedCount?: number; skipped?: Array<{ id: string; email?: string; reason: 'quota-exhausted' | 'banned' }>; error?: string }>
 
   // 获取反代池账号列表
   proxyGetAccounts: () => Promise<{ accounts: unknown[]; availableCount: number }>

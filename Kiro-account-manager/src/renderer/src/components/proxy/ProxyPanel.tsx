@@ -2,7 +2,9 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { Play, Square, RefreshCw, Copy, Check, Server, Activity, AlertCircle, Globe, Zap, Loader2, FileText, Eye, EyeOff, Dices, Cpu, UserCheck, RotateCcw, Users, Clock, Settings2, BarChart3 } from 'lucide-react'
 import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Label, Switch, Badge, Select } from '../ui'
 import { ProxySecurityPanel } from './ProxySecurityPanel'
-import { useAccountsStore } from '../../store/accounts'
+import { useAccountsStore, isBannedAccountError } from '../../store/accounts'
+import { quotaStateSignature, type QuotaSnapshot } from '@shared/quota'
+import type { Account } from '../../types/account'
 import { useTranslation } from '../../hooks/useTranslation'
 import { ProxyLogsDialog } from './ProxyLogsDialog'
 import { ProxyCaptureDialog } from './ProxyCaptureDialog'
@@ -142,6 +144,19 @@ function ensureProxyResponseListenerRegistered(): void {
   })
 }
 
+/**
+ * 把渲染进程的 Account.usage 摊平成 shared/quota 认的形状。
+ * 同步载荷和同步签名都走这一个转换，保证"发出去的额度数据"和"判断要不要重发的依据"永远一致。
+ */
+function toQuotaSnapshot(acc: Account): QuotaSnapshot {
+  return {
+    quotaUsed: acc.usage?.current,
+    quotaLimit: acc.usage?.limit,
+    overageEnabled: acc.usage?.resourceDetail?.overageEnabled,
+    overageCap: acc.usage?.resourceDetail?.overageCap
+  }
+}
+
 export function ProxyPanel() {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
@@ -157,6 +172,8 @@ export function ProxyPanel() {
   const [stats, setStats] = useState<ProxyStats | null>(null)
   const [sessionStats, setSessionStats] = useState<SessionStats | null>(null)
   const [accountCount, setAccountCount] = useState(0)
+  // 上次同步被挡下的账号（额度耗尽 / 被封禁），用于在面板上说明"为什么池子里没这些号"
+  const [skippedAccounts, setSkippedAccounts] = useState<Array<{ id: string; email?: string; reason: 'quota-exhausted' | 'banned' }>>([])
   const [availableCount, setAvailableCount] = useState(0)
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -302,12 +319,17 @@ export function ProxyPanel() {
           authMethod: acc.credentials?.authMethod,
           provider: acc.credentials?.provider || acc.idp,
           // 透传分组 ID：后端 getAvailableAccount 可据此做二次过滤（双保险），即便前端忘了重同步也安全
-          groupId: acc.groupId
+          groupId: acc.groupId,
+          // 额度 / 封禁准入依据：主进程据此挡掉必然请求失败的账号（额度耗尽、被风控）。
+          // 超额字段一并传，且会一路进到账号池——池子自己也要判额度，缺了它会把超额账号误判成耗尽。
+          ...toQuotaSnapshot(acc),
+          lastError: acc.lastError
         }))
 
       const result = await window.api.proxySyncAccounts(proxyAccounts)
       if (result.success) {
         setAccountCount(result.accountCount || 0)
+        setSkippedAccounts(result.skipped || [])
         await fetchStatus()
         setSyncSuccess(true)
         setTimeout(() => setSyncSuccess(false), 2000)
@@ -452,14 +474,23 @@ export function ProxyPanel() {
   useEffect(() => { syncAccountsRef.current = syncAccounts }, [syncAccounts])
 
   /**
-   * 账号集合签名：只反映"参与同步的账号 id + 分组"，**不含** token / 用量 / 状态时间戳。
-   * 这样后台 token 刷新、用量更新等高频变动不会触发重新同步（避免按钮疯狂闪烁），
-   * 仅在真正增删账号 / 改分组时才同步。token 更新由主进程账号池自身刷新逻辑处理。
+   * 账号集合签名：反映"参与同步的账号 id + 分组 + 准入状态"，**不含** token / 具体用量数值 / 状态时间戳。
+   * 这样后台 token 刷新、用量数字的每次微涨不会触发重新同步（避免按钮疯狂闪烁），
+   * 仅在真正增删账号 / 改分组 / 账号跨过「额度耗尽」「被封禁」这条准入线时才同步。
+   * 带上准入状态是必需的：额度耗尽的账号要能被及时踢出池子，月度重置后也要能自动回来。
    */
   const accountsSyncSignature = useMemo(() => {
     return Array.from(accounts.values())
       .filter(a => a.status === 'active' && a.credentials?.accessToken)
-      .map(a => `${a.id}:${a.groupId || ''}`)
+      .map(a => {
+        // 额度状态用 shared/quota 产出，和主进程准入过滤、账号池是同一份判定。
+        // 早先这里手搓过一版「是否超过基础额度 + 是否开超额」，漏了超额上限那一维：
+        // 超额账号从 600 涨到 base+cap 时签名恒为 'xo'，永远不会触发重同步，
+        // 超额真用完了账号还赖在池子里继续接流量。
+        const quota = quotaStateSignature(toQuotaSnapshot(a))
+        const banned = isBannedAccountError(a.lastError) ? 'b' : ''
+        return `${a.id}:${a.groupId || ''}:${quota}${banned}`
+      })
       .sort()
       .join('|')
   }, [accounts])
@@ -577,6 +608,28 @@ export function ProxyPanel() {
               {error}
             </div>
           )}
+
+          {/* 同步准入提示：说明哪些账号被挡在池子外面，避免"账号明明有却不在池里"的困惑 */}
+          {skippedAccounts.length > 0 && (() => {
+            const exhausted = skippedAccounts.filter(s => s.reason === 'quota-exhausted').length
+            const banned = skippedAccounts.filter(s => s.reason === 'banned').length
+            const parts: string[] = []
+            if (exhausted > 0) parts.push(isEn ? `${exhausted} quota-exhausted` : `${exhausted} 个额度耗尽`)
+            if (banned > 0) parts.push(isEn ? `${banned} banned` : `${banned} 个已封禁`)
+            const names = skippedAccounts.slice(0, 5).map(s => s.email || s.id.slice(0, 8)).join('、')
+            const more = skippedAccounts.length > 5 ? (isEn ? ` and ${skippedAccounts.length - 5} more` : ` 等 ${skippedAccounts.length} 个`) : ''
+            return (
+              <div className="flex items-start gap-2 text-warning text-sm">
+                <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
+                <span>
+                  {isEn
+                    ? `Skipped ${parts.join(' / ')} account(s), not added to the pool: ${names}${more}`
+                    : `已跳过 ${parts.join('、')} 的账号，未加入反代池：${names}${more}`}
+                  {accountCount === 0 && (isEn ? ' — pool is empty, requests will fail with "no available account".' : ' —— 池子当前为空，请求会直接返回「无可用账号」。')}
+                </span>
+              </div>
+            )
+          })()}
 
           {/* 服务地址 */}
           {isRunning && (

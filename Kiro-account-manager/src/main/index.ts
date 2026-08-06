@@ -33,6 +33,7 @@ import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
 import { usageLedger } from './proxy/usageLedger'
 import type { AccountStoreInfo } from './proxy/types'
+import { filterSyncableAccounts, describeSkipped, type SyncCandidate } from './proxy/accountSyncFilter'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import {
@@ -46,6 +47,20 @@ import {
   type TraySettings,
   defaultTraySettings
 } from './tray'
+
+/**
+ * 账号同步载荷 = 池子里的账号字段 + 只用于准入判断的 lastError。
+ *
+ * 额度字段（含 overageEnabled / overageCap）必须原样进池子：账号池自己也要判额度，
+ * 少了超额那两个字段它就只会比基础 quotaLimit，把准入层刚放行的超额账号又判成耗尽。
+ */
+type SyncPayloadAccount = ProxyAccount & Pick<SyncCandidate, 'lastError'>
+
+function toPoolAccount(account: SyncPayloadAccount): ProxyAccount {
+  const poolFields: SyncPayloadAccount = { ...account }
+  delete poolFields.lastError
+  return poolFields
+}
 
 // ============ 自动更新配置 ============
 autoUpdater.autoDownload = false
@@ -2333,15 +2348,27 @@ function createWindow(): void {
                 region: acc.credentials?.region || 'us-east-1',
                 authMethod,
                 provider,
-                proxyUrl: buildProxyUrl(acc.id)
+                proxyUrl: buildProxyUrl(acc.id),
+                // 额度/封禁准入所需（与 proxy-sync-accounts 同一套过滤）
+                quotaUsed: acc.usage?.current,
+                quotaLimit: acc.usage?.limit,
+                overageEnabled: acc.usage?.resourceDetail?.overageEnabled,
+                overageCap: acc.usage?.resourceDetail?.overageCap,
+                lastError: acc.lastError
               }
             })
-          if (proxyAccounts.length > 0) {
-            const pool = server.getAccountPool()
-            pool.clear()
-            proxyAccounts.forEach(acc => pool.addAccount(acc))
+
+          // 自启动同样要挡掉额度耗尽 / 被封禁的账号，否则代理一起来就撞 402
+          const { usable, skipped } = filterSyncableAccounts(proxyAccounts)
+          if (skipped.length > 0) {
+            console.log(`[ProxyServer] Auto-sync skipped ${skipped.length} account(s): ${describeSkipped(skipped)}`)
           }
-          return proxyAccounts.length
+          // 一个能用的都没有时不动池子：可能是 store 还没加载完（冷启动），
+          // 留给下面的重试逻辑；真的全耗尽了，重试跑完池子依旧为空，反代会明确报无可用账号
+          if (usable.length > 0) {
+            server.getAccountPool().syncAccounts(usable.map(toPoolAccount))
+          }
+          return usable.length
         }
 
         let syncedCount = syncAccountsToPool()
@@ -6504,16 +6531,24 @@ app.whenReady().then(async () => {
     }
   })
 
-  // IPC: 同步账号到反代池（批量更新）
-  ipcMain.handle('proxy-sync-accounts', (_event, accounts: ProxyAccount[]) => {
+  // IPC: 同步账号到反代池（批量增量更新）
+  // 额度耗尽 / 被封禁的账号在这里被挡下，不进池子——否则轮询必然命中它们，
+  // 客户端只能看到 402 MONTHLY_REQUEST_COUNT 之类的上游错误。
+  ipcMain.handle('proxy-sync-accounts', (_event, accounts: SyncPayloadAccount[]) => {
     try {
       const server = initProxyServer()
       const pool = server.getAccountPool()
-      pool.clear()
-      for (const account of accounts) {
-        pool.addAccount(account)
+      const { usable, skipped } = filterSyncableAccounts(accounts || [])
+      if (skipped.length > 0) {
+        console.log(`[ProxyServer] Sync skipped ${skipped.length} account(s): ${describeSkipped(skipped)}`)
       }
-      return { success: true, accountCount: pool.size }
+      pool.syncAccounts(usable.map(toPoolAccount))
+      return {
+        success: true,
+        accountCount: pool.size,
+        skippedCount: skipped.length,
+        skipped
+      }
     } catch (error) {
       console.error('[ProxyServer] Sync accounts failed:', error)
       return { success: false, error: error instanceof Error ? error.message : 'Failed to sync accounts' }
