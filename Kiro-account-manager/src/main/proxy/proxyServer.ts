@@ -24,6 +24,14 @@ import type {
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
 import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, type KiroModel } from './kiroApi'
+import {
+  isRetryableServerError,
+  serverErrorRetryDelay,
+  retryStreamOnServerError,
+  extractUpstreamStatus,
+  DEFAULT_MAX_SERVER_ERROR_RETRIES,
+  type StreamAttemptResult
+} from './upstreamRetry'
 import { proxyLogger } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
@@ -371,6 +379,7 @@ export class ProxyServer {
       maxConcurrent: 10,
       maxRetries: 3,
       retryDelayMs: 1000,
+      maxServerErrorRetries: DEFAULT_MAX_SERVER_ERROR_RETRIES,
       tokenRefreshBeforeExpiry: 300, // 5分钟提前刷新
       autoStart: false, // 是否自动启动
       clientDrivenToolExecution: true,
@@ -1434,6 +1443,64 @@ export class ProxyServer {
     }
   }
 
+  /**
+   * 流式请求的上游 5xx 重试包装。
+   *
+   * 流式路径原来完全没有重试（"错误由流处理"），上游一个 502 就直接变成客户端报错。
+   * 这里补上：**只在还没往客户端吐过任何内容时**才重试——一旦有 chunk 出去了就没法回退，
+   * 只能把错误透出去。onComplete 之后自然也不会重试。
+   *
+   * 重试保持同一个账号：5xx 是上游网关抖动，不是账号问题；
+   * 而且 callKiroApiStream 内部本来就会把三个端点轮一遍，跨端点绕行已经覆盖了。
+   */
+  private async callKiroApiStreamWithRetry(
+    account: ProxyAccount,
+    payload: Parameters<typeof callKiroApiStream>[1],
+    onChunk: Parameters<typeof callKiroApiStream>[2],
+    onComplete: Parameters<typeof callKiroApiStream>[3],
+    onError: Parameters<typeof callKiroApiStream>[4],
+    signal?: AbortSignal,
+    preferredEndpoint?: ProxyConfig['preferredEndpoint']
+  ): Promise<void> {
+    const maxRetries = this.config.maxServerErrorRetries ?? DEFAULT_MAX_SERVER_ERROR_RETRIES
+    const label = account.email || account.id.slice(0, 8)
+
+    const failure = await retryStreamOnServerError({
+      maxRetries,
+      baseDelayMs: this.config.retryDelayMs || 1000,
+      wait: (ms) => this.waitForRetry(ms, signal),
+      isAborted: () => signal?.aborted === true,
+      onRetry: (retryIndex, delayMs, error) => {
+        console.warn(`[ProxyServer] Upstream 5xx on ${label}, retry ${retryIndex}/${maxRetries} in ${delayMs}ms: ${error.message.slice(0, 200)}`)
+      },
+      onGiveUp: (retries, error) => {
+        console.warn(`[ProxyServer] Upstream still failing after ${retries} retry(ies) on ${label}: ${error.message.slice(0, 200)}`)
+      },
+      attempt: async () => {
+        // 用对象持有，避免闭包赋值被 TS 收窄成永远是初始值
+        const state: StreamAttemptResult = { emitted: false, failure: null }
+        await callKiroApiStream(
+          account,
+          payload,
+          (text, toolUse, isThinking, reasoningSignature, redactedContent) => {
+            state.emitted = true
+            return onChunk(text, toolUse, isThinking, reasoningSignature, redactedContent)
+          },
+          (usage) => {
+            state.emitted = true
+            onComplete(usage)
+          },
+          (error) => { state.failure = error },
+          signal,
+          preferredEndpoint
+        ).catch((error) => { state.failure = error as Error })
+        return state
+      }
+    })
+
+    if (failure) onError(failure)
+  }
+
   // 带重试的 API 调用
   private async callWithRetry<T>(
     account: ProxyAccount,
@@ -1443,6 +1510,10 @@ export class ProxyServer {
   ): Promise<{ result: T; account: ProxyAccount }> {
     const maxRetries = this.config.maxRetries || 3
     const retryDelay = this.config.retryDelayMs || 1000
+    const maxServerErrorRetries = this.config.maxServerErrorRetries ?? DEFAULT_MAX_SERVER_ERROR_RETRIES
+    // 5xx 有独立预算：否则前面几次 401 刷新 / 402 切号会把 maxRetries 吃光，
+    // 真正遇到上游抖动时一次都重试不了
+    let serverErrorRetries = 0
     let lastError: Error | null = null
     let currentAccount = account
     let endpointIndex = 0
@@ -1459,7 +1530,8 @@ export class ProxyServer {
       return null
     }
 
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
+    // 循环上界随 5xx 重试次数一起放宽，让 5xx 的预算独立于其它错误类型
+    for (let attempt = 0; attempt < maxRetries + serverErrorRetries; attempt++) {
       this.throwIfAborted(signal)
       try {
         const result = await apiCall(currentAccount, endpointIndex)
@@ -1469,7 +1541,7 @@ export class ProxyServer {
         lastError = error as Error
         const errMsg = lastError.message || ''
 
-        console.log(`[ProxyServer] API call failed (attempt ${attempt + 1}/${maxRetries}): ${errMsg}`)
+        console.log(`[ProxyServer] API call failed (attempt ${attempt + 1}/${maxRetries + serverErrorRetries}): ${errMsg}`)
 
         // 优先检测账号被长期封禁（不是 token 问题，刷新也没用）
         // 特征：HTTP 403 + reason: "TEMPORARILY_SUSPENDED" 或 AccountSuspendedException / 423
@@ -1555,11 +1627,18 @@ export class ProxyServer {
           continue
         }
 
-        // 5xx: 同账号短退避重试一次；再次 5xx 直接 fallback 到没试过的账号（瞬时故障跨账号绕过）
-        if (errMsg.includes('500') || errMsg.includes('502') || errMsg.includes('503') || errMsg.includes('504')) {
-          console.log('[ProxyServer] Server error, retrying')
+        // 5xx: 同账号短退避重试；第二次及以后的 5xx 顺带 fallback 到没试过的账号（瞬时故障跨账号绕过）。
+        // 用解析出来的状态码判定，不能用 includes('500') —— 错误消息里带着上游响应体，
+        // body 里出现 "500"（比如 max_tokens: 500）会把一个 400 参数错误误判成 5xx 反复重试。
+        if (isRetryableServerError(lastError)) {
+          if (serverErrorRetries >= maxServerErrorRetries) {
+            console.log(`[ProxyServer] Server error, gave up after ${serverErrorRetries} retry(ies)`)
+            break
+          }
+          serverErrorRetries++
+          console.log(`[ProxyServer] Server error, retry ${serverErrorRetries}/${maxServerErrorRetries}`)
           // 第二次及以后的 5xx → 切换账号（旧逻辑会同账号撞死）
-          if (attempt > 0) {
+          if (serverErrorRetries > 1) {
             const nextAccount = switchToNextAccount()
             if (nextAccount && !triedIds.has(nextAccount.id)) {
               console.log(`[ProxyServer] Persistent 5xx on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`)
@@ -1568,7 +1647,7 @@ export class ProxyServer {
               continue
             }
           }
-          await this.waitForRetry(retryDelay * (attempt + 1), signal)
+          await this.waitForRetry(serverErrorRetryDelay(serverErrorRetries, retryDelay), signal)
           continue
         }
 
@@ -2235,7 +2314,7 @@ export class ProxyServer {
   private filterAdminConfigUpdate(input: Record<string, unknown>): Partial<ProxyConfig> {
     const allowed: Array<keyof ProxyConfig> = [
       'enabled', 'enableMultiAccount', 'logRequests', 'logStreamEvents',
-      'maxConcurrent', 'maxRetries', 'retryDelayMs', 'preferredEndpoint',
+      'maxConcurrent', 'maxRetries', 'retryDelayMs', 'maxServerErrorRetries', 'preferredEndpoint',
       'tokenRefreshBeforeExpiry', 'autoStart', 'clientDrivenToolExecution',
       'disableTools', 'payloadSizeLimitKB', 'enableTokenBufferReserve',
       'tokenBufferReserve', 'autoSwitchOnQuotaExhausted', 'accountSelectionStrategy',
@@ -2471,7 +2550,7 @@ export class ProxyServer {
         // SSE 流式
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
         return new Promise<void>((resolve) => {
-          callKiroApiStream(
+          this.callKiroApiStreamWithRetry(
             account as ProxyAccount,
             kiroPayload,
             (text) => {
@@ -3037,7 +3116,7 @@ export class ProxyServer {
     }
 
     return new Promise((resolve) => {
-      callKiroApiStream(
+      this.callKiroApiStreamWithRetry(
         account as any,
         kiroPayload,
         (text, toolUse, isThinking) => {
@@ -3149,8 +3228,10 @@ export class ProxyServer {
           res.end()
 
           this.recordRequestFailed()
-          const errStatusCode = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode ? classifyError(parseInt(errStatusCode)) : ErrorType.RECOVERABLE, errStatusCode ? parseInt(errStatusCode) : undefined)
+          // 用解析出来的状态码，不能拿消息里第一个三位数字：上游响应体里的数字（如 max_tokens 429）
+          // 会被误当成状态码，把账号错误标成配额耗尽
+          const errStatusCode = extractUpstreamStatus(error)
+          this.accountPool.recordError(account.id, errStatusCode ? classifyError(errStatusCode) : ErrorType.RECOVERABLE, errStatusCode)
           // accountId 必带：流已选到账号，失败也要计到该账号名下（账本按账号维度归集）
           this.emitResponse({ path: '/v1/chat/completions', model, status: 500, error: error.message, accountId: account.id })
           this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
@@ -3383,7 +3464,7 @@ export class ProxyServer {
     }
 
     return new Promise((resolve) => {
-      callKiroApiStream(
+      this.callKiroApiStreamWithRetry(
         account as any,
         kiroPayload,
         (text, toolUse, isThinking, reasoningSignature, redactedContent) => {
@@ -3581,8 +3662,9 @@ export class ProxyServer {
           res.end()
 
           this.recordRequestFailed()
-          const errStatusCode2 = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
+          // 同上：状态码必须解析，不能靠消息里第一个三位数字
+          const errStatusCode2 = extractUpstreamStatus(error)
+          this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(errStatusCode2) : ErrorType.RECOVERABLE, errStatusCode2)
           // accountId 必带：流已选到账号，失败也要计到该账号名下（账本按账号维度归集）
           this.emitResponse({ path: '/v1/messages', model, status: 500, error: error.message, accountId: account.id })
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
@@ -3608,8 +3690,7 @@ export class ProxyServer {
   private handleApiError(res: http.ServerResponse, account: { id: string }, error: Error, path: string, model?: string, startTime?: number, signal?: AbortSignal): void {
     if (this.isAbortError(error, signal) || this.isResponseClosed(res)) return
     this.recordRequestFailed()
-    const errCode = error.message.match(/(\d{3})/)?.[1]
-    const parsedCode = errCode ? parseInt(errCode) : 500
+    const parsedCode = extractUpstreamStatus(error) ?? 500
     const errorType = classifyError(parsedCode)
     const isAuthError = error.message.includes('401') || error.message.includes('403') || error.message.includes('Auth')
 

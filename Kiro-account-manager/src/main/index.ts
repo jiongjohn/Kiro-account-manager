@@ -401,6 +401,7 @@ function initProxyServer(): ProxyServer {
     maxConcurrent: 10,
     maxRetries: 3,
     retryDelayMs: 1000,
+    maxServerErrorRetries: 2,
     tokenRefreshBeforeExpiry: 300, // 5分钟提前刷新
     clientDrivenToolExecution: true,
     enableTokenBufferReserve: false,

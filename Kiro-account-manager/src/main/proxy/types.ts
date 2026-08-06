@@ -537,6 +537,8 @@ export interface ProxyConfig {
   // 重试配置
   maxRetries?: number
   retryDelayMs?: number
+  /** 上游 5xx 的重试次数上限，独立于 maxRetries；默认 2（一次请求最多打 3 次上游） */
+  maxServerErrorRetries?: number
   // 首选端点配置
   preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
   // Token 刷新提前量（秒）
