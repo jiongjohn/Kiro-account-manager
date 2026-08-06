@@ -1,6 +1,6 @@
 {
   "name": "kiro-account-manager",
-  "version": "1.7.22",
+  "version": "1.7.23",
   "description": "Kiro Account Manager - Manage your Kiro accounts, usage and subscriptions",
   "main": "./out/main/index.js",
   "author": "Kiro",
@@ -20,7 +20,7 @@
     "build:win": "npm run build && electron-builder --win",
     "build:mac": "electron-vite build && electron-builder --mac",
     "build:linux": "electron-vite build && electron-builder --linux",
-    "test:unit": "node --test src/main/proxy/captureAnalyzer.test.ts src/main/proxy/toolLeakFilter.test.ts src/main/proxy/usageLedger.test.ts",
+    "test:unit": "node --test src/main/proxy/captureAnalyzer.test.ts src/main/proxy/toolLeakFilter.test.ts src/main/proxy/usageLedger.test.ts src/shared/quota.test.ts src/main/proxy/accountSyncFilter.test.ts src/main/proxy/accountPool.test.ts src/main/proxy/accountSyncIntegration.test.ts src/main/proxy/upstreamRetry.test.ts",
     "test:e2e": "node test/e2e-fullsuite/run.mjs",
     "test:e2e:only": "node test/e2e-fullsuite/run.mjs --only"
   },
